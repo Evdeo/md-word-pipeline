@@ -1,0 +1,28 @@
+# Document Identity & Revision History
+# This file is updated frequently — one per project.
+# Revision history is also extracted/updated by docx_to_md.py
+
+document:
+  title: "md_to_docx Capability Showcase"
+  subtitle: "Comprehensive Feature Demonstration and Documentation"
+  author: "Your Name"
+  date: "March 2026"
+  version: "2.0"
+  classification: "Internal Use Only"
+  document_type: "Technical Demonstration"
+
+revisions:
+  - version: "2.0"
+    date: "2026-03-14"
+    author: "Your Name"
+    changes: "Added cross-references, standalone images, code examples, and revision tracking"
+
+  - version: "1.1"
+    date: "2026-03-10"
+    author: "Your Name"
+    changes: "Updated content structure and added table formatting examples"
+
+  - version: "1.0"
+    date: "2026-03-01"
+    author: "Your Name"
+    changes: "Initial release with basic document structure and formatting"
