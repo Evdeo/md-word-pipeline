@@ -166,11 +166,15 @@ project:
 
 ```markdown
 :::appendix
-# A. Reference
+# A. Reference {.nonumber}
+
+## A.1. First subsection {.nonumber}
 
 Headings become A, A.1, A.2, B, B.1 etc.
 :::
 ```
+
+`{.nonumber}` is required on each appendix heading to suppress the normal numbered heading style.
 
 ### Page breaks and spacing
 
