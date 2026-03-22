@@ -7,6 +7,12 @@ Projects live in projects/ next to this file.
 """
 
 import os, re, shutil, subprocess, sys, tempfile
+from typing import Optional
+
+# Ensure UTF-8 output on Windows (needed for non-Latin scripts)
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime
 from pathlib import Path
 
@@ -429,7 +435,24 @@ def _show_picker(projects: list[Path]) -> str | None:
         version = (f"v{info['version']}" if info["version"] else "")[:7]
         author  = (info["author"]          if info["author"]  else "")[:20]
         age     = _file_age(proj / "input")[:10]
-        note    = f"{version:<8}{author:<21}{age}"
+
+        # Quick change count against linked file
+        output_dir  = proj / "output"
+        linked_file = _get_linked_file(output_dir)
+        if linked_file and not linked_file.exists():
+            status_str = "⚠️ "
+        elif linked_file:
+            n = _quick_change_count(proj)
+            if n is None:
+                status_str = ""
+            elif n == 0:
+                status_str = "✅ "
+            else:
+                status_str = f"🟡 {n}  "
+        else:
+            status_str = ""
+
+        note = f"{status_str}{version:<8}{author:<21}{age}"
         items.append((title, note))
 
     _clear()
@@ -496,15 +519,14 @@ def _show_dashboard(state: dict):
         else:
             t.add_row("Built", "[dim]—  not yet built[/dim]")
 
-        n_rx = len(state["received_files"])
-        if n_rx == 0:
-            t.add_row("Received", "[dim]—  nothing waiting[/dim]")
-        elif n_rx == 1:
-            f = state["received_files"][0]
-            t.add_row("Received",
-                      f"[cyan]● {f.name}  [dim]({_file_age(f)})[/dim][/cyan]")
+        linked = state.get("linked_file")
+        if linked is None:
+            t.add_row("Linked file", "[dim]—  export to link[/dim]")
+        elif not linked.exists():
+            t.add_row("Linked file", f"[yellow]⚠ missing: {linked.name}[/yellow]")
         else:
-            t.add_row("Received", f"[cyan]● {n_rx} files waiting[/cyan]")
+            t.add_row("Linked file",
+                      f"[cyan]{linked.name}  [dim]({_file_age(linked)})[/dim][/cyan]")
 
         console.print()
         console.print(Panel(t, title="[bold]Project Dashboard[/bold]",
@@ -512,18 +534,26 @@ def _show_dashboard(state: dict):
                             border_style="blue"))
     else:
         n_md = len(state["md_files"])
-        n_rx = len(state["received_files"])
         print(f"\n  {info['title']}  v{info['version']}  {info['author']}")
         print(f"  Source: {'✓' if n_md else '✗'}  "
               f"Built: {'✓' if state['built_docx'].exists() else '—'}  "
-              f"Received: {n_rx or '—'}")
+              f"Linked: {'✓' if state.get('linked_file') and state['linked_file'].exists() else '—'}")
 
 
 def _prompt_dashboard(state: dict) -> str:
     """Arrow-key menu for the project dashboard. Returns action key."""
     no_src   = not state["md_files"]
     no_built = not state["built_docx"].exists()
-    no_rx    = not state["received_files"]
+    linked_file = state.get("linked_file")
+    has_linked  = linked_file is not None
+    link_missing = has_linked and not linked_file.exists()
+
+    if link_missing:
+        review_hint = "⚠️  linked file missing — re-export to relink"
+    elif has_linked:
+        review_hint = "compare against linked export"
+    else:
+        review_hint = "export first to enable"
 
     items = [
         ("Build",
@@ -531,18 +561,15 @@ def _prompt_dashboard(state: dict) -> str:
         ("Open document",
          "open built Word file" + (" — not yet built" if no_built else "")),
         ("Export",
-         "save Word file to a chosen location" + (" — not yet built" if no_built else "")),
+         "save to a location and link for review" + (" — build first" if no_built else "")),
         None,  # ── separator ──
         ("Open in VS Code", "open project folder in editor"),
         ("Edit info",       "title, author, version"),
         ("Edit properties", "{{placeholder}} values"),
         ("Inspect template","extract styles → config.yaml"),
         None,  # ── separator ──
-        ("Receive file",    "import a reviewer's Word file"),
-        ("Review changes",
-         "compare received against source" if not no_rx
-         else "receive a file first  (option 8)",
-         no_rx),   # disabled when no file received
+        ("Link file",       "set or update the file to compare against"),
+        ("Review changes",  review_hint),
     ]
 
     # Build a direct map: original_index_in_items → action_key
@@ -609,15 +636,111 @@ def _list_projects() -> list[Path]:
     dirs.sort(key=lambda d: (d.name != last, -_project_mtime(d)))
     return dirs
 
+def _linked_file_path(output_dir: Path) -> Path:
+    """Path to the file that stores the linked export location."""
+    return output_dir / ".linked_file"
+
+
+def _get_linked_file(output_dir: Path) -> Optional[Path]:
+    """Return the linked file path, or None if not set."""
+    p = _linked_file_path(output_dir)
+    if not p.exists():
+        return None
+    try:
+        linked = Path(p.read_text(encoding="utf-8").strip())
+        return linked if linked.parts else None
+    except Exception:
+        return None
+
+
+def _set_linked_file(output_dir: Path, file_path: Path) -> None:
+    """Store the linked file path."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _linked_file_path(output_dir).write_text(str(file_path), encoding="utf-8")
+
+
+def _quick_change_count(proj_dir: Path) -> Optional[int]:
+    """Return number of changed sections vs linked file, or None if not applicable.
+    Fast check — just compares section hashes, no HTML generation."""
+    try:
+        from lib.section_diff import diff_documents as _sd
+        output_dir = proj_dir / "output"
+        linked     = _get_linked_file(output_dir)
+        if not linked or not linked.exists():
+            return None
+        built = output_dir / "document.docx"
+        if not built.exists():
+            return None
+
+        import tempfile, shutil as _sh
+        from lib.build_doc import (load_config, load_document_info,
+                                    load_all_yaml_files, substitute_properties,
+                                    collect_files)
+        from lib.build.builder import DocumentBuilder
+
+        input_dir = proj_dir / "input"
+        config    = load_config(input_dir / "config.yaml")
+        doc_info, revisions = load_document_info(input_dir / "document-info.yaml")
+        if doc_info: config["document"] = doc_info
+        config.setdefault("document", {})
+        EXCL  = {"config.yaml", "document-info.yaml", "revisions.yaml"}
+        props = load_all_yaml_files(input_dir, exclude_files=EXCL)
+        for k, v in doc_info.items(): props.setdefault(f"document.{k}", str(v))
+
+        tmp_dir  = Path(tempfile.mkdtemp())
+        baseline = tmp_dir / "baseline.docx"
+        try:
+            builder = DocumentBuilder(config=config, revisions=revisions,
+                                       source_dir=input_dir)
+            builder._verbose = False
+            builder.setup()
+            frontpage, content_files = collect_files(input_dir)
+            all_texts = []
+            for cf in content_files:
+                try:    all_texts.append(substitute_properties(
+                            cf.read_text(encoding="utf-8"), props))
+                except: all_texts.append("")
+            builder.prescan_labels(all_texts)
+            wc = config.get("frontpage", {}).get("word_cover", "")
+            if wc and (input_dir / wc).exists():
+                builder.add_word_cover(input_dir / wc)
+            elif frontpage:
+                builder.add_frontpage(
+                    substitute_properties(frontpage.read_text(encoding="utf-8"), props),
+                    frontpage.parent)
+            builder.add_toc()
+            for cf, ct in zip(content_files, all_texts):
+                try:    builder.add_content(ct, cf.parent)
+                except: pass
+            builder.save(baseline)
+
+            results = _sd(baseline, linked)
+
+            def _count(rs):
+                n = 0
+                for r in rs:
+                    has_direct = (
+                        r.status in ("removed", "added", "moved", "moved_changed") or
+                        (r.status == "changed" and r.baseline and r.received and
+                         r.baseline.content_hash != r.received.content_hash)
+                    )
+                    if has_direct: n += 1
+                    n += _count(r.children)
+                return n
+
+            return _count(results)
+        finally:
+            _sh.rmtree(str(tmp_dir), ignore_errors=True)
+    except Exception:
+        return None
+
+
 def _project_state(proj_dir: Path) -> dict:
     input_dir    = proj_dir / "input"
     output_dir   = proj_dir / "output"
     built_docx   = output_dir / "document.docx"
-    received_dir = output_dir / "received"
-
     md_files = sorted(f for f in input_dir.glob("*.md")
                       if f.name != "00-frontpage.md") if input_dir.exists() else []
-    received = sorted(received_dir.glob("*.docx")) if received_dir.exists() else []
 
     sync_status = "unknown"
     if built_docx.exists() and md_files:
@@ -627,14 +750,16 @@ def _project_state(proj_dir: Path) -> dict:
         if yamls: src_t = max(src_t, max(f.stat().st_mtime for f in yamls))
         sync_status = "source_newer" if src_t > docx_t else "built"
 
+    linked_file = _get_linked_file(output_dir)
+
     return {
         "proj_dir":       proj_dir,
         "input_dir":      input_dir,
         "output_dir":     output_dir,
         "built_docx":     built_docx,
-        "received_files": received,
         "md_files":       md_files,
         "sync_status":    sync_status,
+        "linked_file":    linked_file,
     }
 
 
@@ -1288,9 +1413,7 @@ def _create_project_files(proj_dir: Path, title: str, author: str,
     input_dir  = proj_dir / "input"
     output_dir = proj_dir / "output"
     images_dir = input_dir / "images"
-    received_dir = output_dir / "received"
-
-    for d in [input_dir, images_dir, output_dir, received_dir]:
+    for d in [input_dir, images_dir, output_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Core yaml files
@@ -1299,8 +1422,6 @@ def _create_project_files(proj_dir: Path, title: str, author: str,
     (input_dir / "properties.yaml").write_text(PROPERTIES_YAML, encoding="utf-8")
     (input_dir / "config.yaml").write_text(CONFIG_YAML, encoding="utf-8")
     (input_dir / "00-frontpage.md").write_text(FRONTPAGE_MD, encoding="utf-8")
-    (output_dir / "received" / "README.txt").write_text(
-        "Drop reviewer's edited .docx files here, then run: python run.py\n")
 
     if docx_source:
         # Bootstrap from Word file — convert it
@@ -2486,7 +2607,7 @@ def _add_revision(input_dir: Path, new_version: str,
 
 
 def action_export(state: dict):
-    """Prompt for revision info, rebuild, then export to a chosen location."""
+    """Build and export to a chosen location. Saves the path as the linked file."""
     _rule("Export Word Document")
     _print("")
 
@@ -2499,36 +2620,8 @@ def action_export(state: dict):
     di_path  = state["input_dir"] / "document-info.yaml"
     doc_info, _ = load_document_info(di_path)
 
-    cur_version = doc_info.get("version", "1.0")
-    cur_author  = doc_info.get("author",  "")
-
-    # ── Step 1: Revision info ─────────────────────────────────────────────────
-    _clear()
-    _rule("Export — Revision History")
-    _print("")
-    _print("  Before exporting, record what changed in this version.\n")
-    _print(f"  [dim]Current version: {cur_version}[/dim]\n")
-
-    new_version = _inp("New version number", cur_version)
-    author      = _inp("Author",             cur_author)
-    _print("")
-    _print("  Describe what changed in this version:")
-    _print("  [dim](Press Enter to skip)[/dim]")
-    try:
-        changes = input("  Changes: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        changes = ""
-
-    # ── Step 2: Update document-info.yaml if version changed ─────────────────
-    revision_added = False
-    if new_version != cur_version or changes:
-        _add_revision(state["input_dir"], new_version, author, changes or "—")
-        revision_added = True
-        _print(f"\n  [green]✓ Revision {new_version} recorded.[/green]"
-               if HAS_RICH else f"\n  ✓ Revision {new_version} recorded.")
-
-    # ── Step 3: Rebuild so the cover page shows updated revision table ────────
-    _print("\n  Rebuilding document…")
+    # ── Step 1: Build ─────────────────────────────────────────────────────────
+    _print("  Building document…")
     from lib.build_doc import (load_config, load_document_info as _ldi,
                                load_all_yaml_files, substitute_properties,
                                collect_files)
@@ -2595,14 +2688,22 @@ def action_export(state: dict):
         _pause(); return
     _print(f"  [green]✓ Document rebuilt.[/green]" if HAS_RICH else "  ✓ Rebuilt.")
 
-    # ── Step 4: Pick export destination and copy ──────────────────────────────
+    # ── Step 2: Pick export destination and copy ──────────────────────────────
     _print("\n  Choose where to save the exported file.\n")
 
     # Build suggested filename from title + version
     slug = re.sub(r"[^\w\s-]", "", doc_info2.get("title", "document").lower())
     slug = re.sub(r"[\s_]+", "-", slug).strip("-") or "document"
-    ver  = doc_info2.get("version", new_version)
+    ver  = doc_info2.get("version", "1.0")
     suggested = f"{slug}-v{ver}.docx"
+
+    # Check if there's an existing linked file to suggest as destination
+    existing_linked = _get_linked_file(state["output_dir"])
+    if existing_linked:
+        suggested_dir = str(existing_linked.parent)
+        suggested     = existing_linked.name
+    else:
+        suggested_dir = str(Path.home() / "Documents")
 
     dst = None
     try:
@@ -2615,7 +2716,7 @@ def action_export(state: dict):
             defaultextension=".docx",
             filetypes=[("Word document", "*.docx")],
             initialfile=suggested,
-            initialdir=str(Path.home() / "Documents"),
+            initialdir=suggested_dir,
         )
         root.destroy()
         if chosen:
@@ -2624,43 +2725,61 @@ def action_export(state: dict):
         pass
 
     if dst is None:
-        # Fallback to typed path
         try:
             typed = input(f"  Save to [{suggested}]: ").strip().strip('"').strip("'")
-            dst = Path(typed) if typed else Path.home() / "Documents" / suggested
+            dst = Path(typed) if typed else Path(suggested_dir) / suggested
         except (EOFError, KeyboardInterrupt):
             _print("[dim]Export cancelled.[/dim]")
             _pause(); return
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(output_path, dst)
+
+    # Save this path as the linked file for future review comparisons
+    _set_linked_file(state["output_dir"], dst)
+
     _print(f"\n[green]✓ Exported to: {dst}[/green]"
            if HAS_RICH else f"\n✓ Exported to: {dst}")
+    _print(f"  [dim]Linked for review — changes will be tracked automatically.[/dim]"
+           if HAS_RICH else f"  Linked for review.")
     _pause()
 
 def action_sync(state: dict):
-    """Build fresh from source, diff against received, show terminal summary.
+    """Build fresh from source, diff against linked file, show terminal summary.
     Optionally open the full HTML section report.
     """
     _rule("Review Changes")
     _print("")
 
-    if not state["received_files"]:
-        _print("[yellow]No file in received/ — nothing to compare against.[/yellow]\n"
-               "Use 'Receive file' first to import a reviewer's Word file."
-               if HAS_RICH else "No file in received/. Use 'Receive file' first.")
-        _pause(); return
-
-    from lib.sync import _find_received_docx
     from lib.section_diff import diff_documents as _section_diff, build_html_report
 
     input_dir  = state["input_dir"]
     output_dir = state["output_dir"]
 
-    received = _find_received_docx(output_dir)
-    if not received:
-        _print("[yellow]No file in received/.[/yellow]")
+    # Use linked file (set on export) — fall back to received/ folder
+    linked = _get_linked_file(output_dir)
+
+    if linked is None:
+        # No linked file — check received/ folder as fallback
+        from lib.sync import _find_received_docx
+        received_file = _find_received_docx(output_dir)
+        if not received_file:
+            _print("[yellow]No linked file found.[/yellow]\n"
+                   "Export the document first — the export destination is saved\n"
+                   "automatically as the file to compare against."
+                   if HAS_RICH else
+                   "No linked file. Export first to set the comparison target.")
+            _pause(); return
+        linked = received_file
+
+    if not linked.exists():
+        _print(f"[yellow]Linked file not found:[/yellow]\n  {linked}\n"
+               if HAS_RICH else f"Linked file not found:\n  {linked}\n")
+        if _confirm("  Open the folder it was last in?"):
+            _open_path(linked.parent)
         _pause(); return
+
+    received = linked
 
     _print(f"  Building from source…\n" if not HAS_RICH
            else "  [dim]Building from source…[/dim]\n")
@@ -2741,6 +2860,8 @@ def action_sync(state: dict):
                 (r.status == "changed" and
                  r.baseline is not None and r.received is not None and
                  r.baseline.content_hash != r.received.content_hash)
+                # contains_changes = parent unchanged, only children changed
+                # not counted as a separate action
             )
             if has_direct_change:
                 key = r.status.replace("moved_changed", "moved")
@@ -2799,29 +2920,32 @@ def action_sync(state: dict):
     _pause()
 
 
-def action_receive_file(state: dict):
-    _rule("Receive File")
+def action_link_file(state: dict):
+    """Point to the file to compare against — use when exporting for the first
+    time, or when the file has moved and the old link is broken."""
+    _rule("Link File")
     _print("")
-    _print("Select the reviewer's Word file to import.\n")
 
-    received_dir = state["output_dir"] / "received"
-    received_dir.mkdir(parents=True, exist_ok=True)
+    current = _get_linked_file(state["output_dir"])
+    if current:
+        if current.exists():
+            _print(f"  Currently linked: [cyan]{current}[/cyan]\n"
+                   if HAS_RICH else f"  Currently linked: {current}\n")
+        else:
+            _print(f"  [yellow]Linked file missing:[/yellow] {current}\n"
+                   if HAS_RICH else f"  Linked file missing: {current}\n")
 
-    src = _pick_file("Select reviewer's Word file", initial_dir=Path.home())
+    _print("  Select the Word file to compare against.\n"
+           "  This is usually the file you exported and shared with a reviewer.\n")
+
+    src = _pick_file("Select Word file", initial_dir=current.parent if current else Path.home())
     if not src or not src.exists():
-        _print("[yellow]No file selected.[/yellow]")
+        _print("[yellow]No file selected.[/yellow]" if HAS_RICH else "No file selected.")
         _pause(); return
 
-    dst = received_dir / src.name
-    # If a file with the same name exists, add a timestamp suffix
-    if dst.exists():
-        ts  = datetime.now().strftime("%Y%m%d-%H%M")
-        dst = received_dir / f"{src.stem}_{ts}{src.suffix}"
-
-    shutil.copy(src, dst)
-    _print(f"\n[green]✓ Received: {dst.name}[/green]")
-    _print(f"  Saved to: output/received/{dst.name}")
-    _print("\n[dim]Run Sync Check or Merge to review the changes.[/dim]")
+    _set_linked_file(state["output_dir"], src)
+    _print(f"\n[green]✓ Linked: {src}[/green]"
+           if HAS_RICH else f"\n  Linked: {src}")
     _pause()
 
 
@@ -3106,7 +3230,7 @@ def _run_project(proj_dir: Path):
         "5":  action_edit_info,
         "6":  action_edit_properties,
         "7":  action_inspect,
-        "8":  action_receive_file,
+        "8":  action_link_file,
         "9":  action_sync,
     }
 

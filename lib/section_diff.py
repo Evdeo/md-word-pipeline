@@ -318,6 +318,11 @@ def _match_sections(
                 results.append(SectionResult(
                     status='identical', baseline=bs, received=rs,
                     children=children))
+            elif bs.content_hash == rs.content_hash:
+                # Own content unchanged — only children changed
+                results.append(SectionResult(
+                    status='contains_changes', baseline=bs, received=rs,
+                    children=children))
             else:
                 results.append(SectionResult(
                     status='changed', baseline=bs, received=rs,
@@ -763,7 +768,7 @@ def _render_result_html(result: SectionResult,
     sec      = result.baseline or result.received
     heading  = sec.heading
     level    = sec.level
-    is_open  = status != 'identical'
+    is_open  = status not in ('identical', 'contains_changes')
     open_attr = ' open' if is_open else ''
 
     # Badge
@@ -911,7 +916,19 @@ def build_html_report(
 
     def _count(rs):
         for r in rs:
-            counts[r.status] = counts.get(r.status, 0) + 1
+            # Only count sections with direct content changes — not parents
+            # that are marked changed solely because a child changed.
+            has_direct = (
+                r.status in ('removed', 'added', 'moved', 'moved_changed') or
+                (r.status == 'changed' and
+                 r.baseline is not None and r.received is not None and
+                 r.baseline.content_hash != r.received.content_hash)
+            )
+            if has_direct:
+                key = r.status.replace('moved_changed', 'moved')
+                counts[key] = counts.get(key, 0) + 1
+            elif r.status == 'identical':
+                counts['identical'] = counts.get('identical', 0) + 1
             _count(r.children)
 
     _count(results)

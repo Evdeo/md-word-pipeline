@@ -95,13 +95,16 @@ Tree overview at the top, click anything to jump there.
 ### Merged cells
 
 ```markdown
-| Region {cs=2} | <<      | Sales |
-|---------------|---------|-------|
-| EMEA {rs=2}   | UK      | 142   |
-| ^^            | Germany | 98    |
+| Region | <<      | Sales |
+|--------|---------|-------|
+| EMEA   | UK      | 142   |
+| ^^     | Germany | 98    |
 ```
 
-`{cs=2}` colspan · `{rs=2}` rowspan · `<<` and `^^` mark consumed cells
+`<<` — consumed by the cell to its left (colspan)
+`^^` — consumed by the cell above (rowspan)
+
+You can optionally use `{cs=2}` and `{rs=2}` on the anchor cell to be explicit, but `<<` and `^^` alone are sufficient.
 
 Column widths: add `{col-widths="20%,50%,30%"}` after the table.
 
