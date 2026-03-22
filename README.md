@@ -51,7 +51,6 @@ my-project/
 │   └── properties.yaml     ← custom variables
 └── output/
     ├── document.docx
-    ├── received/           ← drop reviewed files here
     └── review_report.html
 ```
 
