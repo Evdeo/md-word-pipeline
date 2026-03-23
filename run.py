@@ -3438,50 +3438,54 @@ body { background:#525659; font-family:sans-serif; }
 </div>
 <div id="container"></div>
 <script>
-let lastVer = null;
+let lastVer  = null;
+let loading  = false;
 const container = document.getElementById('container');
 const status    = document.getElementById('status');
 
 async function loadPages() {
-  // Poll until preview_pages.txt exists
-  let n = 0;
-  while (!n) {
-    try {
-      const r = await fetch('preview_pages.txt?t=' + Date.now());
-      if (r.ok) { n = parseInt((await r.text()).trim()); }
-    } catch(e) {}
-    if (!n) await new Promise(res => setTimeout(res, 800));
-  }
-
-  // Fetch all SVGs in parallel and inline them
-  // IDs are page-prefixed server-side so no collisions occur
-  const t = Date.now();
-  const svgs = await Promise.all(
-    Array.from({length: n}, (_, i) =>
-      fetch(`preview_page_${i}.svg?t=${t}`).then(r => r.text())
-    )
-  );
-
-  const scrollY = window.scrollY;
-  const frag = document.createDocumentFragment();
-  svgs.forEach(svg => {
-    const wrap = document.createElement('div');
-    wrap.className = 'page';
-    wrap.innerHTML = svg;
-    const svgEl = wrap.querySelector('svg');
-    if (svgEl) {
-      svgEl.removeAttribute('width');
-      svgEl.removeAttribute('height');
-      svgEl.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  if (loading) return;
+  loading = true;
+  try {
+    // Poll until preview_pages.txt exists
+    let n = 0;
+    while (!n) {
+      try {
+        const r = await fetch('preview_pages.txt?t=' + Date.now());
+        if (r.ok) { n = parseInt((await r.text()).trim()); }
+      } catch(e) {}
+      if (!n) await new Promise(res => setTimeout(res, 800));
     }
-    frag.appendChild(wrap);
-  });
-  container.innerHTML = '';
-  container.appendChild(frag);
-  window.scrollTo(0, scrollY);
+    const t = Date.now();
+    const svgs = await Promise.all(
+      Array.from({length: n}, (_, i) =>
+        fetch(`preview_page_${i}.svg?t=${t}`).then(r => r.text())
+      )
+    );
+    const scrollY = window.scrollY;
+    const frag = document.createDocumentFragment();
+    svgs.forEach(svg => {
+      const wrap = document.createElement('div');
+      wrap.className = 'page';
+      wrap.innerHTML = svg;
+      const svgEl = wrap.querySelector('svg');
+      if (svgEl) {
+        svgEl.removeAttribute('width');
+        svgEl.removeAttribute('height');
+        svgEl.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+      }
+      frag.appendChild(wrap);
+    });
+    container.innerHTML = '';
+    container.appendChild(frag);
+    window.scrollTo(0, scrollY);
+  } finally {
+    loading = false;
+  }
 }
 
 async function poll() {
+  if (loading) return;
   try {
     const r = await fetch('.preview_version?t=' + Date.now());
     const v = await r.text();
@@ -3496,15 +3500,18 @@ async function poll() {
   } catch(e) {}
 }
 
-loadPages()
-  .then(() => {
-    status.textContent = '\u2713 ' + new Date().toLocaleTimeString();
-    status.style.color = '#7cb97c';
-  })
-  .catch(e => {
-    status.textContent = 'Error: ' + e.message;
-    status.style.color = '#e07070';
-  });
+// Initial load — set lastVer after so poll() doesn't reload immediately
+loadPages().then(async () => {
+  try {
+    const r = await fetch('.preview_version?t=' + Date.now());
+    lastVer = await r.text();
+  } catch(e) {}
+  status.textContent = '\u2713 ' + new Date().toLocaleTimeString();
+  status.style.color = '#7cb97c';
+}).catch(e => {
+  status.textContent = 'Error: ' + e.message;
+  status.style.color = '#e07070';
+});
 
 setInterval(poll, 1000);
 </script>
@@ -3530,21 +3537,50 @@ setInterval(poll, 1000);
                 fresh = _project_state(proj_dir)
                 _silent_build(fresh, out_path=preview_docx)
 
-                from docx2pdf import convert as _docx2pdf
                 import io as _io, sys as _sys
+                # Convert docx → PDF using Word COM directly with flags that
+                # bypass Protected View — no Word security settings needed.
                 if sys.platform == "win32":
                     try:
                         import pythoncom
                         pythoncom.CoInitialize()
                     except ImportError:
                         pass
-                _old_out, _old_err = _sys.stdout, _sys.stderr
-                _captured = _io.StringIO()
-                _sys.stdout = _sys.stderr = _captured
+                _pdf_ok = False
                 try:
-                    _docx2pdf(str(preview_docx), str(preview_pdf))
+                    import win32com.client as _wc
+                    _word = _wc.DispatchEx("Word.Application")
+                    _word.Visible = False
+                    _word.DisplayAlerts = False
+                    try:
+                        _doc = _word.Documents.Open(
+                            str(preview_docx),
+                            ConfirmConversions=False,
+                            ReadOnly=True,
+                            AddToRecentFiles=False,
+                            NoEncodingDialog=True,
+                        )
+                        _doc.ExportAsFixedFormat(
+                            str(preview_pdf),
+                            17,    # wdExportFormatPDF
+                            False, # OpenAfterExport
+                            0,     # OptimizeFor: print
+                        )
+                        _doc.Close(SaveChanges=False)
+                        _pdf_ok = True
+                    finally:
+                        _word.Quit()
+                except Exception:
+                    # Fallback to docx2pdf if direct COM fails
+                    from docx2pdf import convert as _docx2pdf
+                    _old_out, _old_err = _sys.stdout, _sys.stderr
+                    _sys.stdout = _sys.stderr = _io.StringIO()
+                    try:
+                        _docx2pdf(str(preview_docx), str(preview_pdf))
+                        _pdf_ok = True
+                    finally:
+                        _sys.stdout, _sys.stderr = _old_out, _old_err
                 finally:
-                    _sys.stdout, _sys.stderr = _old_out, _old_err
                     if sys.platform == "win32":
                         try:
                             import pythoncom
@@ -3552,8 +3588,8 @@ setInterval(poll, 1000);
                         except ImportError:
                             pass
 
-                if not preview_pdf.exists() or preview_pdf.stat().st_size < 100:
-                    raise RuntimeError(f"PDF not produced. Output: {_captured.getvalue()!r}")
+                if not _pdf_ok or not preview_pdf.exists() or preview_pdf.stat().st_size < 100:
+                    raise RuntimeError("PDF not produced by Word")
 
                 import pymupdf as _mu
                 doc = _mu.open(str(preview_pdf))
@@ -3616,6 +3652,7 @@ setInterval(poll, 1000);
                 else:
                     print(f"  Preview build error: {_e}")
                     traceback.print_exc()
+                input("  Press Enter to continue...")
                 return False
             finally:
                 _build_p_running[0] = False
@@ -3644,11 +3681,13 @@ setInterval(poll, 1000);
             pass
 
         # Clear stale preview files from previous sessions before starting
-        for _stale in list(output_dir.glob("preview_page_*.svg")) +                       [output_dir / "preview_pages.txt",
+        for _stale in list(output_dir.glob("preview_page_*.svg")) + [
+                       output_dir / "preview_pages.txt",
                        output_dir / "preview.pdf",
+                       output_dir / "preview.docx",
                        output_dir / ".preview_version"]:
             try: _stale.unlink()
-            except FileNotFoundError: pass
+            except (FileNotFoundError, PermissionError): pass
 
         (output_dir / "preview.html").write_text(PREVIEW_HTML, encoding="utf-8")
         _build_p()
@@ -3715,7 +3754,15 @@ setInterval(poll, 1000);
         if raw == "w":
             built = state["built_docx"]
             if built.exists():
-                _open_path(built)
+                # If preview is running, open a copy so Word doesn't conflict
+                # with docx2pdf which may have preview.docx open via COM
+                import shutil as _sh, tempfile as _tf
+                _tmp = Path(_tf.gettempdir()) / f"evdeo_{built.name}"
+                try:
+                    _sh.copy2(str(built), str(_tmp))
+                    _open_path(_tmp)
+                except Exception:
+                    _open_path(built)
             else:
                 _print("  [yellow]Not built yet.[/yellow]"
                        if HAS_RICH else "  Not built yet.")
