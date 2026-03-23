@@ -170,11 +170,34 @@ def _open_path(path: Path):
         _print(f"[yellow]Could not open: {e}[/yellow]")
 
 def _open_vscode(folder: Path):
-    """Open a folder in VS Code, with fallback to OS file manager."""
+    """Open a folder in VS Code, fully detached so its logs don't bleed
+    back into the terminal."""
+
+    def _launch(cmd):
+        """Launch cmd fully detached from our terminal."""
+        if sys.platform == "win32":
+            # DETACHED_PROCESS prevents the child from inheriting our console
+            DETACHED = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            subprocess.Popen(
+                cmd,
+                creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                cmd,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+
     # Try 1: code command (works when VS Code is in PATH)
     try:
-        subprocess.Popen(["code", str(folder)])
-        _print(f"[green]Opened in VS Code: {folder.name}[/green]")
+        _launch(["code", str(folder)])
         return
     except FileNotFoundError:
         pass
@@ -184,7 +207,6 @@ def _open_vscode(folder: Path):
     # Try 2: known install locations
     candidates = []
     if sys.platform == "win32":
-        import os
         local = os.environ.get("LOCALAPPDATA", "")
         candidates = [
             Path(local) / "Programs" / "Microsoft VS Code" / "Code.exe",
@@ -203,8 +225,7 @@ def _open_vscode(folder: Path):
     for exe in candidates:
         if exe.exists():
             try:
-                subprocess.Popen([str(exe), str(folder)])
-                _print(f"[green]Opened in VS Code: {folder.name}[/green]")
+                _launch([str(exe), str(folder)])
                 return
             except Exception:
                 continue
@@ -416,185 +437,138 @@ def _menu(items, title="", extras=None, initial=0):
     return _plain_menu()
 
 
-def _show_picker(projects: list[Path]) -> str | None:
-    """Project picker with arrow-key navigation."""
-    last = _load_last()
+def _get_project_settings(output_dir: Path) -> dict:
+    """Load per-project settings from output/.settings JSON."""
+    import json
+    p = output_dir / ".settings"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except Exception:
+        return {}
 
+
+def _save_project_settings(output_dir: Path, settings: dict) -> None:
+    """Save per-project settings to output/.settings JSON."""
+    import json
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / ".settings").write_text(
+        json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def _copy_default_to_project(input_dir: Path) -> None:
+    """Overwrite project config.yaml with the current default CONFIG_YAML."""
+    cfg_path = input_dir / "config.yaml"
+    _backup_file(cfg_path)
+    cfg_path.write_text(CONFIG_YAML, encoding="utf-8")
+
+def _show_picker(projects: list[Path]) -> str | None:
+    """Project picker with change indicators."""
+    last = _load_last()
     initial = 0
     for i, p in enumerate(projects):
         if p.name == last:
             initial = i; break
 
-    # Fixed-width columns so the note field never wraps regardless of terminal width.
-    # title(32) | version(7) | author(20) | age
     items = []
     for proj in projects:
         info    = _project_display(proj)
         title   = info["title"]
-        if len(title) > 28: title = title[:27] + "\u2026"
+        if len(title) > 28: title = title[:27] + "…"
         version = (f"v{info['version']}" if info["version"] else "")[:7]
-        author  = (info["author"]          if info["author"]  else "")[:20]
+        author  = (info["author"]         if info["author"]  else "")[:20]
         age     = _file_age(proj / "input")[:10]
 
-        # Quick change count against linked file
-        output_dir  = proj / "output"
-        linked_file = _get_linked_file(output_dir)
+        linked_file = _get_linked_file(proj / "output")
         if linked_file and not linked_file.exists():
             status_str = "⚠️ "
         elif linked_file:
             n = _quick_change_count(proj)
-            if n is None:
-                status_str = ""
-            elif n == 0:
-                status_str = "✅ "
-            else:
-                status_str = f"🟡 {n}  "
+            if n is None:   status_str = ""
+            elif n == 0:    status_str = "✅ "
+            else:           status_str = f"🟡 {n}  "
         else:
             status_str = ""
 
-        note = f"{status_str}{version:<8}{author:<21}{age}"
-        items.append((title, note))
+        items.append((title, f"{status_str}{version:<8}{author:<21}{age}"))
 
     _clear()
     n_arch = len(_archived_projects())
     arch_label = f"Archive a project  ({n_arch} archived)" if n_arch else "Archive a project"
-
     picker_extras = [("a", "New project"), ("s", arch_label)]
     if n_arch:
         picker_extras.append(("f", "Unarchive a project"))
     picker_extras.append(("d", "Change default config"))
     picker_extras.append(("q", "Quit"))
 
-    result = _menu(items,
-                   title="Select a project",
-                   extras=picker_extras,
-                   initial=initial)
-
+    result = _menu(items, title="Select a project",
+                   extras=picker_extras, initial=initial)
     if isinstance(result, int):
         return projects[result].name
     return result
 
-# ── project dashboard ──────────────────────────────────────────────────────────
-
 def _show_dashboard(state: dict):
-    """Print the static project info panel, then show the arrow-key action menu."""
-    proj_dir = state["proj_dir"]
-    info     = _project_display(proj_dir)
-
-    _clear()
+    """Compact running view status panel."""
+    from lib.build_doc import load_document_info as _ldi
+    info, _ = _ldi(state["input_dir"] / "document-info.yaml")
+    proj_name = info.get("title", state["proj_dir"].name)
+    version   = info.get("version", "")
+    author    = info.get("author", "")
+    linked    = state.get("linked_file")
+    settings  = _get_project_settings(state["output_dir"])
+    preview   = settings.get("live_preview", True)
 
     if HAS_RICH:
-        t = Table(box=box.SIMPLE, show_header=False, padding=(0,1))
-        t.add_column(width=12, style="dim")
+        from rich.table import Table as _T
+        from rich       import box   as _box
+        t = _T(box=_box.SIMPLE, show_header=False, padding=(0, 1))
+        t.add_column(style="dim", width=14)
         t.add_column()
-
-        t.add_row("Project", f"[bold]{info['title']}[/bold]")
-        meta_parts = filter(None, [
-            f"v{info['version']}"  if info["version"]        else "",
-            info["author"]          if info["author"]         else "",
-            f"[dim]{info['classification']}[/dim]"
-                                    if info["classification"] else "",
-        ])
-        t.add_row("", "  ".join(meta_parts))
-        t.add_row("", "")
-
-        n_md = len(state["md_files"])
-        if n_md:
-            latest = _file_age(max(state["md_files"], key=lambda f: f.stat().st_mtime))
-            t.add_row("Source",
-                      f"[green]✓[/green]  {n_md} file{'s' if n_md!=1 else ''}  "
-                      f"[dim](last edit {latest})[/dim]")
+        t.add_row("Project",
+                  f"[bold]{proj_name}[/bold]"
+                  + (f"  [dim]v{version}[/dim]" if version else "")
+                  + (f"  [dim]{author}[/dim]"   if author  else ""))
+        built = state["built_docx"]
+        if built.exists():
+            t.add_row("Word file",
+                      f"[cyan]{built.name}[/cyan]  [dim]{_file_age(built)}[/dim]")
         else:
-            t.add_row("Source", "[red]✗  no markdown files found[/red]")
-
-        if state["built_docx"].exists():
-            age = _file_age(state["built_docx"])
-            if state["sync_status"] == "source_newer":
-                t.add_row("Built",
-                          f"[yellow]⚠  source edited after last build  "
-                          f"[dim]({age})[/dim][/yellow]")
-            else:
-                t.add_row("Built",
-                          f"[green]✓[/green]  document.docx  [dim]({age})[/dim]")
-        else:
-            t.add_row("Built", "[dim]—  not yet built[/dim]")
-
-        linked = state.get("linked_file")
+            t.add_row("Word file", "[dim]not yet built[/dim]")
         if linked is None:
-            t.add_row("Linked file", "[dim]—  export to link[/dim]")
+            t.add_row("Linked file", "[dim]not linked[/dim]")
         elif not linked.exists():
-            t.add_row("Linked file", f"[yellow]⚠ missing: {linked.name}[/yellow]")
+            t.add_row("Linked file",
+                      f"[yellow]⚠️  missing: {linked.name}[/yellow]")
         else:
             t.add_row("Linked file",
-                      f"[cyan]{linked.name}  [dim]({_file_age(linked)})[/dim][/cyan]")
-
+                      f"[cyan]{linked.name}[/cyan]  [dim]{_file_age(linked)}[/dim]")
+        t.add_row("Live preview",
+                  "[green]on[/green]" if preview else "[dim]off[/dim]")
         console.print()
-        console.print(Panel(t, title="[bold]Project Dashboard[/bold]",
-                            subtitle=f"[dim]projects/{proj_dir.name}[/dim]",
-                            border_style="blue"))
+        from rich.panel import Panel as _P
+        console.print(_P(t,
+                         title=f"[bold]projects/{state['proj_dir'].name}[/bold]",
+                         border_style="blue"))
+        console.print()
+        console.print("  [cyan][W][/cyan] Open Word  "
+                      "[cyan][V][/cyan] VS Code  "
+                      "[cyan][P][/cyan] Toggle preview  "
+                      "[cyan][M][/cyan] More  "
+                      "[cyan][B][/cyan] Back")
+        console.print()
     else:
-        n_md = len(state["md_files"])
-        print(f"\n  {info['title']}  v{info['version']}  {info['author']}")
-        print(f"  Source: {'✓' if n_md else '✗'}  "
-              f"Built: {'✓' if state['built_docx'].exists() else '—'}  "
-              f"Linked: {'✓' if state.get('linked_file') and state['linked_file'].exists() else '—'}")
-
+        built = state["built_docx"]
+        print(f"\n  {proj_name}  v{version}  {author}")
+        print(f"  Word: {'built' if built.exists() else 'not built'}  "
+              f"Preview: {'on' if preview else 'off'}")
+        print("  [W] Word  [V] VS Code  [P] Toggle preview  "
+              "[M] More  [B] Back\n")
 
 def _prompt_dashboard(state: dict) -> str:
-    """Arrow-key menu for the project dashboard. Returns action key."""
-    no_src   = not state["md_files"]
-    no_built = not state["built_docx"].exists()
-    linked_file = state.get("linked_file")
-    has_linked  = linked_file is not None
-    link_missing = has_linked and not linked_file.exists()
-
-    if link_missing:
-        review_hint = "⚠️  linked file missing — re-export to relink"
-    elif has_linked:
-        review_hint = "compare against linked export"
-    else:
-        review_hint = "export first to enable"
-
-    items = [
-        ("Build",
-         "markdown → Word" + (" — write content first" if no_src else "")),
-        ("Open document",
-         "open built Word file" + (" — not yet built" if no_built else "")),
-        ("Export",
-         "save to a location and link for review" + (" — build first" if no_built else "")),
-        None,  # ── separator ──
-        ("Open in VS Code", "open project folder in editor"),
-        ("Edit info",       "title, author, version"),
-        ("Edit properties", "{{placeholder}} values"),
-        ("Inspect template","extract styles → config.yaml"),
-        None,  # ── separator ──
-        ("Link file",       "set or update the file to compare against"),
-        ("Review changes",  review_hint),
-    ]
-
-    # Build a direct map: original_index_in_items → action_key
-    # This is immune to separator positions shifting the numbering.
-    action_keys = ["1","2","3","4","5","6","7","8","9","10"]
-    idx_to_key = {}
-    key_num = 0
-    for i, item in enumerate(items):
-        if item is not None:
-            idx_to_key[i] = action_keys[key_num]
-            key_num += 1
-
-    result = _menu(items,
-                   title="",
-                   extras=[("b","Back to projects"), ("q","Quit")])
-
-    if isinstance(result, int):
-        return idx_to_key.get(result, "b")
-    return result  # "b" or "q"
-
-# ── project actions ────────────────────────────────────────────────────────────
-
-
-
-# -- Project management ---------------------------------------------
+    try:
+        raw = input("  Select: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "b"
+    return raw or ""
 
 PROJECTS_DIR = ROOT / "projects"
 ARCHIVE_DIR  = PROJECTS_DIR / ".archive"
@@ -2948,6 +2922,54 @@ def action_link_file(state: dict):
            if HAS_RICH else f"\n  Linked: {src}")
     _pause()
 
+    # ── Find a free port and start HTTP server ────────────────────────────────
+    import socket
+    def _free_port():
+        with socket.socket() as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+
+    port = _free_port()
+
+    class _Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(output_dir), **kwargs)
+        def log_message(self, *args): pass   # suppress request logs
+
+    server = socketserver.TCPServer(("", port), _Handler)
+    server.allow_reuse_address = True
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    # ── Initial build ─────────────────────────────────────────────────────────
+    _print("  Building initial preview…")
+    _build_preview()
+
+    url = f"http://localhost:{port}/preview.html"
+    _print(f"\n[green]  ✓ Preview running at {url}[/green]\n"
+           f"  [dim]Edit and save your markdown — browser updates automatically.[/dim]\n"
+           f"  [dim]Press Enter to stop.[/dim]\n"
+           if HAS_RICH else
+           f"\n  Preview: {url}\n  Edit markdown, browser updates on save.\n  Press Enter to stop.\n")
+
+    import webbrowser
+    try: webbrowser.open(url)
+    except: pass
+
+    # Wait for Enter
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+    # Cleanup
+    server.shutdown()
+    if observer:
+        observer.stop()
+        observer.join()
+
+    _print("\n[dim]  Preview stopped.[/dim]\n" if HAS_RICH else "\n  Stopped.\n")
+
 
 def action_open_document(state: dict):
     if not state["built_docx"].exists():
@@ -3218,67 +3240,526 @@ def _apply_template_to_config(docx_path: Path, input_dir: Path):
 
 # ── project runner ─────────────────────────────────────────────────────────────
 
+def _action_more(state: dict) -> None:
+    """More menu — Document and Config categories."""
+
+    def _run_action(fn):
+        _clear()
+        try:
+            fn(state)
+        except KeyboardInterrupt:
+            _print("\n[yellow]Interrupted.[/yellow]"); _pause()
+        except PermissionError as e:
+            fname = getattr(e, "filename", None)
+            if fname and "docx" in str(fname).lower():
+                _print("\n[red]Cannot write \u2014 file is open in Word. Close it first.[/red]"
+                       if HAS_RICH else "\nCannot save \u2014 close the file in Word first.")
+            else:
+                _print(f"\n[red]Permission denied: {e}[/red]"
+                       if HAS_RICH else f"\nPermission denied: {e}")
+            _pause()
+        except Exception as e:
+            _print(f"\n[red]Error: {e}[/red]" if HAS_RICH else f"\nError: {e}")
+            import traceback; traceback.print_exc()
+            _pause()
+
+    CATEGORIES = [
+        ("Document", [
+            ("Export",          "save Word file to a chosen location", action_export),
+            ("Open Word file",  "open the built document",             action_open_document),
+            ("Link file",       "set or update the file to compare against", action_link_file),
+            ("Review changes",  "section-by-section diff vs linked file",    action_sync),
+        ]),
+        ("Config", [
+            ("Edit info",           "title, author, version, classification", action_edit_info),
+            ("Edit properties",     "{{placeholder}} values",                 action_edit_properties),
+            ("Inspect template",    "extract styles from a Word file",        action_inspect),
+            ("Copy default config", "replace this project's config with the default",
+             lambda s: (
+                 _copy_default_to_project(s["input_dir"]),
+                 _print("\n[green]\u2713 Default config applied.[/green]\n"
+                        if HAS_RICH else "\n  Default config applied.\n"),
+                 _pause()
+             )),
+        ]),
+    ]
+
+    while True:
+        _clear()
+        _rule("More Options")
+        _print("")
+
+        # Build flat list with category separators for display
+        flat = []   # (label, note, fn | None)
+        for cat_name, actions in CATEGORIES:
+            flat.append((f"── {cat_name} ──", "", None))
+            for label, note, fn in actions:
+                flat.append((label, note, fn))
+
+        # Only pass real items (non-headers) to _menu
+        menu_items = [(l, n) if fn else None for l, n, fn in flat]
+
+        result = _menu(menu_items, title="More options", extras=[("b", "Back")])
+        if not isinstance(result, int) or result >= len(flat):
+            return
+
+        _, _, fn = flat[result]
+        if fn is None:
+            continue   # clicked a category header — ignore
+
+        _run_action(fn)
+
+
+def _silent_build(state: dict, out_path: Path = None) -> None:
+    """Build document silently. Used by running view and preview."""
+    from lib.build_doc import (load_config, load_document_info,
+                                load_all_yaml_files, substitute_properties,
+                                collect_files)
+    from lib.build.builder import DocumentBuilder
+
+    input_dir  = state["input_dir"]
+    output_dir = state["output_dir"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out = out_path or (output_dir / "document.docx")
+
+    config = load_config(input_dir / "config.yaml")
+    doc_info, revisions = load_document_info(input_dir / "document-info.yaml")
+    if doc_info: config["document"] = doc_info
+    config.setdefault("document", {})
+    EXCL  = {"config.yaml", "document-info.yaml", "revisions.yaml"}
+    props = load_all_yaml_files(input_dir, exclude_files=EXCL)
+    for k, v in doc_info.items(): props.setdefault(f"document.{k}", str(v))
+
+    builder = DocumentBuilder(config=config, revisions=revisions,
+                               source_dir=input_dir)
+    builder._verbose = False
+    builder.setup()
+    frontpage, content_files = collect_files(input_dir)
+    all_texts = []
+    for cf in content_files:
+        try:    all_texts.append(substitute_properties(
+                    cf.read_text(encoding="utf-8"), props))
+        except: all_texts.append("")
+    builder.prescan_labels(all_texts)
+    wc = config.get("frontpage", {}).get("word_cover", "")
+    if wc and (input_dir / wc).exists():
+        builder.add_word_cover(input_dir / wc)
+    elif frontpage:
+        builder.add_frontpage(
+            substitute_properties(frontpage.read_text(encoding="utf-8"), props),
+            frontpage.parent)
+    builder.add_toc()
+    for cf, ct in zip(content_files, all_texts):
+        try:    builder.add_content(ct, cf.parent)
+        except: pass
+    builder.save(out)
+
+
 def _run_project(proj_dir: Path):
-    """Inner loop: project dashboard for a single project."""
+    """Running view: open VS Code + live preview, then W/V/P/M/B keys."""
+    import threading, time as _time
+
     _save_last(proj_dir.name)
+    state      = _project_state(proj_dir)
+    output_dir = state["output_dir"]
+    input_dir  = state["input_dir"]
+    settings   = _get_project_settings(output_dir)
+    preview_on = settings.get("live_preview", True)
 
-    actions = {
-        "1":  action_build,
-        "2":  action_open_document,
-        "3":  action_export,
-        "4":  action_open_vscode,
-        "5":  action_edit_info,
-        "6":  action_edit_properties,
-        "7":  action_inspect,
-        "8":  action_link_file,
-        "9":  action_sync,
+    # ── Changes warning ───────────────────────────────────────────────────────
+    linked = state.get("linked_file")
+    if linked and linked.exists():
+        n = _quick_change_count(proj_dir)
+        if n and n > 0:
+            _clear()
+            _rule("Changes Detected")
+            _print("")
+            if HAS_RICH:
+                console.print(f"  [yellow]⚠️  {n} change(s) found in linked file:[/yellow]")
+                console.print(f"  [dim]{linked}[/dim]\n")
+                console.print("  [cyan][R][/cyan] Open review report")
+                console.print("  [dim][any key] Continue[/dim]\n")
+            else:
+                print(f"  ⚠️  {n} change(s) in linked file.\n"
+                      "  [R] Open review report  [any] Continue\n")
+            try:    raw = input("  > ").strip().lower()
+            except: raw = ""
+            if raw == "r":
+                _clear()
+                action_sync(state)
+
+    # ── Initial build ─────────────────────────────────────────────────────────
+    _clear()
+    _rule("Opening Project")
+    _print("  Building…")
+    try:
+        _silent_build(state)
+        _print("  [green]✓ Built[/green]" if HAS_RICH else "  ✓ Built")
+    except Exception as e:
+        _print(f"  [yellow]Build failed: {e}[/yellow]"
+               if HAS_RICH else f"  Build failed: {e}")
+
+    # ── Preview state ─────────────────────────────────────────────────────────
+    preview_server   = None
+    preview_observer = None
+    preview_url      = None
+
+    PREVIEW_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live Preview</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#525659; font-family:sans-serif; }
+#toolbar {
+  position:fixed; top:0; left:0; right:0; height:36px;
+  background:#323639; display:flex; align-items:center;
+  padding:0 16px; gap:16px; z-index:100;
+  box-shadow:0 1px 4px rgba(0,0,0,.4);
+}
+#toolbar span { color:#ccc; font-size:12px; }
+#status { color:#7cb97c; font-size:11px; }
+#container { margin-top:36px; padding:24px 0;
+  display:flex; flex-direction:column; align-items:center; }
+.page {
+  box-shadow:0 4px 24px rgba(0,0,0,.5);
+  margin-bottom:24px; background:white;
+  width:min(794px, 95vw);
+}
+.page svg { display:block; width:100%; height:auto; }
+.page svg text { user-select:text; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <span>\U0001f4c4 Live Preview</span>
+  <span id="status">Loading\u2026</span>
+</div>
+<div id="container"></div>
+<script>
+let lastVer = null;
+const container = document.getElementById('container');
+const status    = document.getElementById('status');
+
+async function loadPages() {
+  // Poll until preview_pages.txt exists
+  let n = 0;
+  while (!n) {
+    try {
+      const r = await fetch('preview_pages.txt?t=' + Date.now());
+      if (r.ok) { n = parseInt((await r.text()).trim()); }
+    } catch(e) {}
+    if (!n) await new Promise(res => setTimeout(res, 800));
+  }
+
+  // Fetch all SVGs in parallel and inline them
+  // IDs are page-prefixed server-side so no collisions occur
+  const t = Date.now();
+  const svgs = await Promise.all(
+    Array.from({length: n}, (_, i) =>
+      fetch(`preview_page_${i}.svg?t=${t}`).then(r => r.text())
+    )
+  );
+
+  const scrollY = window.scrollY;
+  const frag = document.createDocumentFragment();
+  svgs.forEach(svg => {
+    const wrap = document.createElement('div');
+    wrap.className = 'page';
+    wrap.innerHTML = svg;
+    const svgEl = wrap.querySelector('svg');
+    if (svgEl) {
+      svgEl.removeAttribute('width');
+      svgEl.removeAttribute('height');
+      svgEl.setAttribute('preserveAspectRatio', 'xMidYMid meet');
     }
+    frag.appendChild(wrap);
+  });
+  container.innerHTML = '';
+  container.appendChild(frag);
+  window.scrollTo(0, scrollY);
+}
 
+async function poll() {
+  try {
+    const r = await fetch('.preview_version?t=' + Date.now());
+    const v = await r.text();
+    if (v !== lastVer) {
+      lastVer = v;
+      status.textContent = 'Rebuilding\u2026';
+      status.style.color = '#e0c070';
+      await loadPages();
+      status.textContent = '\u2713 ' + new Date().toLocaleTimeString();
+      status.style.color = '#7cb97c';
+    }
+  } catch(e) {}
+}
+
+loadPages()
+  .then(() => {
+    status.textContent = '\u2713 ' + new Date().toLocaleTimeString();
+    status.style.color = '#7cb97c';
+  })
+  .catch(e => {
+    status.textContent = 'Error: ' + e.message;
+    status.style.color = '#e07070';
+  });
+
+setInterval(poll, 1000);
+</script>
+</body>
+</html>"""
+
+
+    def _start_preview():
+        nonlocal preview_server, preview_observer, preview_url
+        import http.server, socketserver, socket, time
+
+        preview_docx = output_dir / "preview.docx"
+        preview_pdf  = output_dir / "preview.pdf"
+        ver_file     = output_dir / ".preview_version"
+
+        _build_p_running = [False]
+
+        def _build_p():
+            if _build_p_running[0]:
+                return
+            _build_p_running[0] = True
+            try:
+                _print("[dim]  Preview: building docx…[/dim]")
+                fresh = _project_state(proj_dir)
+                _silent_build(fresh, out_path=preview_docx)
+
+                _print("[dim]  Preview: converting to PDF…[/dim]")
+                from docx2pdf import convert as _docx2pdf
+                import io as _io, sys as _sys
+                if sys.platform == "win32":
+                    try:
+                        import pythoncom
+                        pythoncom.CoInitialize()
+                    except ImportError:
+                        pass
+                _old_out, _old_err = _sys.stdout, _sys.stderr
+                _captured = _io.StringIO()
+                _sys.stdout = _sys.stderr = _captured
+                try:
+                    _docx2pdf(str(preview_docx), str(preview_pdf))
+                finally:
+                    _sys.stdout, _sys.stderr = _old_out, _old_err
+                    if sys.platform == "win32":
+                        try:
+                            import pythoncom
+                            pythoncom.CoUninitialize()
+                        except ImportError:
+                            pass
+
+                if not preview_pdf.exists() or preview_pdf.stat().st_size < 100:
+                    raise RuntimeError(f"PDF not produced. Output: {_captured.getvalue()!r}")
+
+                _print("[dim]  Preview: converting to SVG…[/dim]")
+                import pymupdf as _mu
+                doc = _mu.open(str(preview_pdf))
+                n   = doc.page_count
+
+                for old in output_dir.glob("preview_page_*.svg"):
+                    try:
+                        idx = int(old.stem.split("_")[-1])
+                        if idx >= n: old.unlink()
+                    except ValueError:
+                        pass
+
+                import re as _re
+
+                def _prefix_svg_ids(svg: str, page_num: int) -> str:
+                    """Prefix all SVG IDs with page number to prevent collisions
+                    when multiple pages are inlined into the same HTML document."""
+                    prefix = f"p{page_num}-"
+                    ids = set(_re.findall(r'\bid="([^"]+)"', svg))
+                    if not ids:
+                        return svg
+                    # Build one combined pattern for all IDs and do 4 passes
+                    pat = '|'.join(_re.escape(i) for i in sorted(ids, key=len, reverse=True))
+                    svg = _re.sub(rf'\bid="({pat})"', lambda m: f'id="{prefix}{m.group(1)}"', svg)
+                    svg = _re.sub(rf'href="#({pat})"', lambda m: f'href="#{prefix}{m.group(1)}"', svg)
+                    svg = _re.sub(rf'url\(#({pat})\)', lambda m: f'url(#{prefix}{m.group(1)})', svg)
+                    svg = _re.sub(rf'xlink:href="#({pat})"', lambda m: f'xlink:href="#{prefix}{m.group(1)}"', svg)
+                    return svg
+
+                for i, page in enumerate(doc):
+                    # Visual layer: text as paths — always renders correctly
+                    svg_visual = page.get_svg_image(text_as_path=1)
+                    svg_visual = _prefix_svg_ids(svg_visual, i)
+
+                    # Text layer: extract <text> elements for Ctrl+F searchability.
+                    # text_as_path=0 can miss some glyphs due to font encoding,
+                    # but as an invisible overlay it doesn't matter — any text
+                    # that decodes correctly becomes searchable.
+                    svg_text = page.get_svg_image(text_as_path=0)
+                    text_els = _re.findall(r'<text\b.*?</text>', svg_text, _re.DOTALL)
+                    if text_els:
+                        overlay = ('<g style="fill:transparent;pointer-events:none;" aria-hidden="true">\n'
+                                   + '\n'.join(text_els)
+                                   + '\n</g>')
+                        svg_visual = svg_visual.rstrip()
+                        if svg_visual.endswith('</svg>'):
+                            svg_visual = svg_visual[:-6] + '\n' + overlay + '\n</svg>'
+
+                    (output_dir / f"preview_page_{i}.svg").write_text(svg_visual, encoding="utf-8")
+                doc.close()
+
+                (output_dir / "preview_pages.txt").write_text(str(n), encoding="utf-8")
+                ver_file.write_text(str(time.time()), encoding="utf-8")
+                _print("[dim]  Preview: ready[/dim]")
+                return True
+            except Exception as _e:
+                import traceback
+                if HAS_RICH:
+                    console.print(f"  [red]Preview build error: {_e}[/red]")
+                    console.print(f"  [red]{traceback.format_exc()}[/red]")
+                else:
+                    print(f"  Preview build error: {_e}")
+                    traceback.print_exc()
+                return False
+            finally:
+                _build_p_running[0] = False
+
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events    import FileSystemEventHandler
+
+            class _H(FileSystemEventHandler):
+                def __init__(self): self._last = 0.0
+                def on_modified(self, event):
+                    if event.is_directory: return
+                    p = Path(event.src_path)
+                    if p.suffix not in ('.md', '.yaml', '.yml'): return
+                    if p.name.startswith('.'): return
+                    now = time.time()
+                    if now - self._last < 0.5: return
+                    self._last = now
+                    _build_p()
+
+            obs = Observer()
+            obs.schedule(_H(), str(input_dir), recursive=False)
+            obs.start()
+            preview_observer = obs
+        except ImportError:
+            pass
+
+        # Clear stale preview files from previous sessions before starting
+        for _stale in list(output_dir.glob("preview_page_*.svg")) +                       [output_dir / "preview_pages.txt",
+                       output_dir / "preview.pdf",
+                       output_dir / ".preview_version"]:
+            try: _stale.unlink()
+            except FileNotFoundError: pass
+
+        (output_dir / "preview.html").write_text(PREVIEW_HTML, encoding="utf-8")
+        _build_p()
+
+        def _free_port(preferred=None):
+            if preferred:
+                try:
+                    with socket.socket() as s:
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        s.bind(('', preferred))
+                        return preferred
+                except OSError:
+                    pass
+            with socket.socket() as s:
+                s.bind(('', 0)); return s.getsockname()[1]
+
+        preferred = settings.get("preview_port")
+        port = _free_port(preferred)
+        settings["preview_port"] = port
+        _save_project_settings(output_dir, settings)
+
+        class _SH(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=str(output_dir), **kw)
+            def log_message(self, *a): pass
+            def end_headers(self):
+                # Prevent browser caching so updated SVGs and HTML are always fresh
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                super().end_headers()
+
+        srv = socketserver.TCPServer(("", port), _SH)
+        srv.allow_reuse_address = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        preview_server = srv
+        preview_url    = f"http://localhost:{port}/preview.html"
+
+        import webbrowser
+        # Only open browser if this is a fresh server (new port)
+        if not preferred or port != preferred:
+            try: webbrowser.open(preview_url)
+            except: pass
+
+    def _stop_preview():
+        if preview_server:   preview_server.shutdown()
+        if preview_observer:
+            preview_observer.stop()
+            preview_observer.join()
+
+    if preview_on:
+        _start_preview()
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
     while True:
         _clear()
         state = _project_state(proj_dir)
         _show_dashboard(state)
+        if preview_url:
+            _print(f"  [dim]Preview: {preview_url}[/dim]\n"
+                   if HAS_RICH else f"  Preview: {preview_url}\n")
 
-        choice = _prompt_dashboard(state)
+        raw = _prompt_dashboard(state)
 
-        if choice == "q":
-            _print("\n[dim]Goodbye.[/dim]\n")
-            sys.exit(0)
-
-        if choice == "b":
-            return  # back to project picker
-
-        if choice in actions:
-            _clear()
-            try:
-                actions[choice](state)
-            except KeyboardInterrupt:
-                _print("\n[yellow]Interrupted.[/yellow]")
-                _pause()
-            except PermissionError as e:
-                # Most common cause: the output .docx is open in Word
-                fname = getattr(e, "filename", None)
-                if fname and "docx" in str(fname).lower():
-                    _print("\n[red]Cannot write the document — it is open in Word.\n"
-                           "  Close the file in Word and try again.[/red]"
-                           if HAS_RICH else
-                           "\nCannot save — the .docx file is open. Close it in Word first.")
-                else:
-                    _print(f"\n[red]Permission denied: {e}[/red]"
-                           if HAS_RICH else f"\nPermission denied: {e}")
-                _pause()
-            except Exception as e:
-                _print(f"\n[red]Unexpected error: {e}[/red]"
-                       if HAS_RICH else f"\nError: {e}")
-                import traceback; traceback.print_exc()
+        if raw == "w":
+            built = state["built_docx"]
+            if built.exists():
+                _open_path(built)
+            else:
+                _print("  [yellow]Not built yet.[/yellow]"
+                       if HAS_RICH else "  Not built yet.")
                 _pause()
 
+        elif raw == "v":
+            _open_vscode(proj_dir)
 
-# ── archive ───────────────────────────────────────────────────────────────────
+        elif raw == "p":
+            preview_on = not preview_on
+            settings["live_preview"] = preview_on
+            _save_project_settings(output_dir, settings)
+            if preview_on and preview_server is None:
+                _start_preview()
+                _print("  [green]Preview started.[/green]"
+                       if HAS_RICH else "  Preview started.")
+            elif not preview_on:
+                _stop_preview()
+                preview_server = preview_observer = preview_url = None
+                _print("  [dim]Preview stopped.[/dim]"
+                       if HAS_RICH else "  Preview stopped.")
+            _pause()
 
+        elif raw == "m":
+            _action_more(state)
 
+        elif raw == "r":
+            linked = state.get("linked_file")
+            if linked and linked.exists():
+                _clear()
+                action_sync(state)
+            else:
+                _print("  [yellow]No linked file.[/yellow]"
+                       if HAS_RICH else "  No linked file.")
+                _pause()
 
-# -- Entry point --------------------------------------------------------------
+        elif raw in ("b", "q", ""):
+            _stop_preview()
+            return
+
 
 def main():
     PROJECTS_DIR.mkdir(exist_ok=True)

@@ -557,6 +557,17 @@ def format_data_table(table: Table, col_widths: Optional[str] = None,
                     if child.tag not in _KEEP_TCPR:
                         tcPr.remove(child)
 
+    # ── Prevent rows from splitting across pages ─────────────────────────────
+    for tr in tbl.findall(qn("w:tr")):
+        trPr = tr.find(qn("w:trPr"))
+        if trPr is None:
+            trPr = OxmlElement("w:trPr")
+            tr.insert(0, trPr)
+        if trPr.find(qn("w:cantSplit")) is None:
+            cantSplit = OxmlElement("w:cantSplit")
+            cantSplit.set(qn("w:val"), "1")
+            trPr.append(cantSplit)
+
     if col_widths:
         apply_col_widths(table, col_widths, total_dxa)
 

@@ -591,7 +591,8 @@ class DocumentBuilder:
         segment_pattern = re.compile(
             r'(:::\s*\{[^}]*\}.*?:::(?:\s*\n)?'   # styled block
             r'|:::space\{[^}]*\}'                  # space directive
-            r'|\{\{revisions\.table\}\})',          # revisions placeholder
+            r'|\{\{revisions\.table\}\}'            # revisions placeholder
+            r'|(?:^|\n)\+\+\+(?:\n|$))',           # page break
             re.DOTALL
         )
 
@@ -610,6 +611,11 @@ class DocumentBuilder:
                     lines=int(m_lines.group(1)) if m_lines else 0,
                     pt=float(m_pt.group(1)) if m_pt else 0
                 )
+                continue
+
+            # ── page break ───────────────────────────────────────────────
+            if segment.strip() == '+++':
+                self._emit_page_break()
                 continue
 
             # ── revisions table ───────────────────────────────────────────
@@ -1303,10 +1309,6 @@ class DocumentBuilder:
                 para.paragraph_format.space_before = Pt(0)
                 para.paragraph_format.space_after  = Pt(0)
 
-            show_line = line_cfg and line_cfg.get("show", False)
-            if show_line and text_cell.paragraphs:
-                _add_hf_border(text_cell.paragraphs[-1], line_cfg, "bottom")
-
             # ── Image cell — right-aligned image ─────────────────────────────
             for p in list(img_cell.paragraphs):
                 p._element.getparent().remove(p._element)
@@ -1328,6 +1330,16 @@ class DocumentBuilder:
             vAlign = OxmlElement("w:vAlign")
             vAlign.set(qn("w:val"), "center")
             tcPr.append(vAlign)
+
+            # ── Separator line — full-width paragraph after the table ─────────
+            # A paragraph border on a standalone paragraph always spans the
+            # full content width, regardless of any table or image above it.
+            show_line = line_cfg and line_cfg.get("show", False)
+            if show_line:
+                sep = hf.add_paragraph()
+                sep.paragraph_format.space_before = Pt(0)
+                sep.paragraph_format.space_after  = Pt(0)
+                _add_hf_border(sep, line_cfg, "top")
 
         # ── Decide which header builder to use ────────────────────────────────
         hdr_cfg      = self.config["header"]
@@ -1353,12 +1365,28 @@ class DocumentBuilder:
     # ── horizontal rule ───────────────────────────────────────────────────────
 
     def _emit_hrule(self):
-        """Render --- as a page break."""
+        """Render --- as a horizontal rule (line across the page)."""
         para = self.doc.add_paragraph()
-        run  = para.add_run()
-        br   = OxmlElement("w:br")
-        br.set(qn("w:type"), "page")
-        run._element.append(br)
+        pPr  = para._p.get_or_add_pPr()
+        pBdr = OxmlElement("w:pBdr")
+        bot  = OxmlElement("w:bottom")
+        bot.set(qn("w:val"),   "single")
+        bot.set(qn("w:sz"),    "6")
+        bot.set(qn("w:space"), "1")
+        bot.set(qn("w:color"), "AAAAAA")
+        pBdr.append(bot)
+        pPr.append(pBdr)
+        para.paragraph_format.space_before = Pt(6)
+        para.paragraph_format.space_after  = Pt(6)
+
+    def _emit_page_break(self):
+        """Render +++ as a page break.
+        
+        Sets a flag so the NEXT paragraph gets w:pageBreakBefore on its pPr.
+        This avoids the blank page that occurs when an empty break paragraph
+        precedes a paragraph with w:keepNext (e.g. Heading 1).
+        """
+        self._pending_page_break = True
 
     # ── block dispatcher ──────────────────────────────────────────────────────
 
@@ -1369,15 +1397,25 @@ class DocumentBuilder:
         # Don't reset for BlankLine (empty lines between alerts should preserve the chain)
         if t not in ("BlockQuote", "Quote", "Alert", "BlankLine"):
             self._last_was_alert = False
+            self._last_was_blockquote = False
 
         if   t == "Heading":       self._emit_heading(node, src)
         elif t == "Paragraph":     self._emit_paragraph(node, src)
         elif t in ("FencedCode", "CodeBlock"): self._emit_code(node)
         elif t == "List":          self._emit_list(node, src)
-        elif t in ("BlockQuote", "Quote", "Alert"): self._emit_blockquote(node, src)
+        elif t in ("BlockQuote", "Quote", "Alert"):
+            self._emit_blockquote(node, src)
+            self._last_was_blockquote = True
+            return
         elif t == "Table":         self._emit_table(node)
         elif t == "ThematicBreak": self._emit_hrule()
-        elif t == "BlankLine":     pass
+        elif t == "BlankLine":
+            # Extra blank lines after a blockquote add visible space
+            if getattr(self, "_last_was_blockquote", False):
+                extra = self.doc.add_paragraph()
+                extra.paragraph_format.space_before = Pt(0)
+                extra.paragraph_format.space_after  = Pt(8)
+                extra.paragraph_format.line_spacing = Pt(0.1)
 
     # ── heading ───────────────────────────────────────────────────────────────
 
@@ -1393,6 +1431,7 @@ class DocumentBuilder:
 
         level = min(node.level, 6)
         para  = self.doc.add_paragraph(style=f"Heading {level}")
+        self._apply_pending_break(para)
         
         # Check if we're in appendix mode
         if self._appendix_mode:
@@ -1511,8 +1550,25 @@ class DocumentBuilder:
 
     # ── paragraph ─────────────────────────────────────────────────────────────
 
+    def _apply_pending_break(self, para):
+        """If a page break was requested, apply it to this paragraph's pPr."""
+        if getattr(self, "_pending_page_break", False):
+            pPr = para._p.get_or_add_pPr()
+            pb  = OxmlElement("w:pageBreakBefore")
+            pb.set(qn("w:val"), "1")
+            existing = pPr.find(qn("w:pageBreakBefore"))
+            if existing is not None:
+                pPr.remove(existing)
+            pPr.append(pb)
+            self._pending_page_break = False
+
     def _emit_paragraph(self, node, src: Path):
         text = self._plain_text(node)
+
+        # ── page break: +++
+        if text.strip() == "+++":
+            self._emit_page_break()
+            return
 
         # ── figure caption: *Figure: description {#anchor}*  (anchor optional)
         m = re.match(r"^\*?Figure:\s+(.*?)(?:\s+\{#([\w-]+)\})?\s*\*?$", text.strip())
@@ -1542,6 +1598,7 @@ class DocumentBuilder:
         if not clean:
             return
         para = self.doc.add_paragraph()
+        self._apply_pending_break(para)
         self._fill_inline(para, node, src)
         
         # Apply styling overrides if set for this cover page block
@@ -1574,14 +1631,16 @@ class DocumentBuilder:
         para = self.doc.add_paragraph(style="Caption")
         para.alignment = self._last_img_alignment
 
-        # Don't set bold/italic explicitly — the Caption paragraph style
-        # already defines both. Setting them on runs causes Word to strip
-        # them on save (redundant explicit = style inheritance), which
-        # produces false positives in the review diff.
+        # Label ("Figure N:") — bold + italic
+        # Description — italic only
         label = f"Figure {fig_num}:"
-        para.add_run(label)
+        label_run = para.add_run(label)
+        label_run.bold   = True
+        label_run.italic = True
         if desc:
-            para.add_run(" " + desc)
+            desc_run = para.add_run(" " + desc)
+            desc_run.bold   = False
+            desc_run.italic = True
 
         self._bm_id += 1
         _add_bookmark(para, self._bm_id, bm_name)
@@ -1605,11 +1664,16 @@ class DocumentBuilder:
         para = self.doc.add_paragraph(style="Caption")
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        # Don't set bold/italic explicitly — Caption style handles it.
+        # Label ("Table N:") — bold + italic
+        # Description — italic only
         label = f"Table {tbl_num}:"
-        para.add_run(label)
+        label_run = para.add_run(label)
+        label_run.bold   = True
+        label_run.italic = True
         if desc:
-            para.add_run(" " + desc)
+            desc_run = para.add_run(" " + desc)
+            desc_run.bold   = False
+            desc_run.italic = True
 
         self._bm_id += 1
         _add_bookmark(para, self._bm_id, bm_name)
@@ -1830,16 +1894,29 @@ class DocumentBuilder:
             # 0pt gap - no extra spacing, relies on grey backgrounds for separation
             spacer = self.doc.add_paragraph()
             spacer.paragraph_format.space_before = Pt(0)
-            spacer.paragraph_format.space_after = Pt(0)  # No gap - boxes touch but grey bg provides separation
+            spacer.paragraph_format.space_after  = Pt(8)
         else:
             # Regular blockquote: Use paragraph style
             children = node.children if hasattr(node, 'children') and isinstance(node.children, list) else []
+            paras = []
             for child in children:
                 if child.__class__.__name__ == 'Paragraph':
                     para = self.doc.add_paragraph(style='Block Quote')
                     self._fill_inline(para, child, src)
+                    paras.append(para)
                 else:
                     self._emit_block(child, src)
+            # Cap the blockquote with a zero-height unstyled paragraph.
+            # This stops the blue left border cleanly at the last quote line.
+            # The cap paragraph has normal space_after so following text
+            # is properly spaced, and extra blank lines in the source
+            # naturally add more space via repeated empty paragraphs.
+            if paras:
+                paras[-1].paragraph_format.space_after = Pt(0)
+                cap = self.doc.add_paragraph()
+                cap.paragraph_format.space_before = Pt(0)
+                cap.paragraph_format.space_after  = Pt(8)
+                cap.paragraph_format.line_spacing = Pt(0.1)
 
     # ── table ─────────────────────────────────────────────────────────────────
 

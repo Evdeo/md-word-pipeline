@@ -51,6 +51,7 @@ my-project/
 │   └── properties.yaml     ← custom variables
 └── output/
     ├── document.docx
+    ├── received/           ← drop reviewed files here
     └── review_report.html
 ```
 
@@ -181,7 +182,8 @@ Headings become A, A.1, A.2, B, B.1 etc.
 ### Page breaks and spacing
 
 ```markdown
----                  ← page break
+---                  ← horizontal rule (line across the page)
++++                  ← page break
 :::space{lines=2}    ← blank lines
 :::space{pt=24}      ← exact points
 ```

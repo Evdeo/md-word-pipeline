@@ -13,7 +13,7 @@ The primary objectives of this showcase are to:
 5. **Showcase image handling** including standalone images, figure groups, and size controls
 6. **Highlight cross-referencing** capabilities for figures, tables, and sections
 
----
++++
 
 # Document Structure
 
@@ -41,7 +41,7 @@ The deepest level of heading hierarchy available.
 
 Headings can be excluded from the table of contents using the `{.notoc}` attribute, or numbering can be suppressed with `{.nonumber}`.
 
----
++++
 
 # Typography and Text Formatting
 
@@ -67,7 +67,7 @@ Technical terms and code snippets can be displayed inline using backticks: `func
 
 Blockquotes feature a distinctive left border and italicized text for visual differentiation.
 
----
++++
 
 # Lists and Enumeration
 
@@ -107,7 +107,7 @@ Lists can be nested to show hierarchical relationships:
 
 This demonstrates the converter's ability to handle complex list structures with proper indentation and formatting.
 
----
++++
 
 # Tables
 
@@ -170,7 +170,7 @@ Tables can have custom column widths specified as percentages using the `{col-wi
 
 In this example, the first column occupies 15% of the table width, the second column 25%, and the third column (containing longer descriptions) occupies 60% of the available space.
 
----
++++
 
 # Images and Figures
 
@@ -218,7 +218,7 @@ Multiple images can be displayed side-by-side for comparison purposes:
 
 The figure group above, referenced as [***Figure***](#pipeline), demonstrates how multiple related images can be presented together with individual sub-captions (a, b, c) and an overall group caption.
 
----
++++
 
 # Cross-References and Linking
 
@@ -232,7 +232,7 @@ Sections (e.g., [Section 4.2](#lists-and-enumeration) covers list functionality)
 
 External resources can be linked directly: [Markdown Specification](https://commonmark.org) or [Microsoft Word Documentation](https://support.microsoft.com).
 
----
++++
 
 # Code Examples
 
@@ -287,7 +287,7 @@ function parseConfig(configPath) {
 
 *Code Block 2: JavaScript configuration parser implementation.*
 
----
++++
 
 # Special Elements
 
@@ -311,11 +311,11 @@ GitHub-style alerts provide visual emphasis for different message types:
 
 Horizontal rules can be used to separate sections visually:
 
----
++++
 
 They create a clear break without starting a new page.
 
----
++++
 
 ## Vertical Space
 
@@ -331,7 +331,7 @@ Or use `pt` for an exact point value:
 
 Both examples above create white space without forcing a page break.
 
----
++++
 
 # Appendix {.nonumber}
 
@@ -415,6 +415,6 @@ Based on the configuration:
 
 These values demonstrate how properties from YAML files are dynamically inserted into the document content at conversion time.
 
----
++++
 
 *End of Document*
