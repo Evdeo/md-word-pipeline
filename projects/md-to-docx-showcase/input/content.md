@@ -415,6 +415,6 @@ Based on the configuration:
 
 These values demonstrate how properties from YAML files are dynamically inserted into the document content at conversion time.
 
-+++
+---
 
 *End of Document*
