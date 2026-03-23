@@ -3527,11 +3527,9 @@ setInterval(poll, 1000);
                 return
             _build_p_running[0] = True
             try:
-                _print("[dim]  Preview: building docx…[/dim]")
                 fresh = _project_state(proj_dir)
                 _silent_build(fresh, out_path=preview_docx)
 
-                _print("[dim]  Preview: converting to PDF…[/dim]")
                 from docx2pdf import convert as _docx2pdf
                 import io as _io, sys as _sys
                 if sys.platform == "win32":
@@ -3557,7 +3555,6 @@ setInterval(poll, 1000);
                 if not preview_pdf.exists() or preview_pdf.stat().st_size < 100:
                     raise RuntimeError(f"PDF not produced. Output: {_captured.getvalue()!r}")
 
-                _print("[dim]  Preview: converting to SVG…[/dim]")
                 import pymupdf as _mu
                 doc = _mu.open(str(preview_pdf))
                 n   = doc.page_count
@@ -3610,7 +3607,6 @@ setInterval(poll, 1000);
 
                 (output_dir / "preview_pages.txt").write_text(str(n), encoding="utf-8")
                 ver_file.write_text(str(time.time()), encoding="utf-8")
-                _print("[dim]  Preview: ready[/dim]")
                 return True
             except Exception as _e:
                 import traceback
