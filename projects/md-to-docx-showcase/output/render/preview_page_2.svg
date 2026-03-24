@@ -3876,7 +3876,7 @@
 </g>
 </g>
 
-<g style="fill:transparent;pointer-events:none;" aria-hidden="true">
+<g style="fill:transparent;pointer-events:all;" aria-hidden="true">
 <text xml:space="preserve" transform="matrix(1 0 -0 1 0 792)" font-size="11.04" font-family="Calibri"><tspan y="-709.54" x="72.024 77.6544 80.436489 82.931529 88.81585 94.678089 100.31953 105.817447 108.345607 113.73312 118.425128 123.71329 132.5784 138.34128 140.73696 146.23488">8. Code Examples</tspan></text>
 <text xml:space="preserve" transform="matrix(1 0 -0 1 0 792)" font-size="11.04" font-family="Calibri"><tspan y="-709.54" x="150.5"> </tspan></text>
 <text xml:space="preserve" transform="matrix(1 0 -0 1 0 792)" font-size="11.04" font-family="Calibri"><tspan y="-709.54" x="151.82 154.57999 157.33997 160.09995 162.85993 165.6199 168.37989 171.13986 173.89984 176.65982 179.4198 182.17978 184.93976 187.69974 190.45972 193.2197 195.97968 198.73966 201.49964 204.25962 207.01959 209.77957 212.53955 215.29953 218.05951 220.81949 223.57947 226.33945 229.09943 231.8594 234.61939 237.37937">................................</tspan></text>

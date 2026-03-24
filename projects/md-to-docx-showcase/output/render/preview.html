@@ -22,7 +22,7 @@ body { background:#525659; font-family:sans-serif; }
   width:min(794px, 95vw);
 }
 .page svg { display:block; width:100%; height:auto; }
-.page svg text { user-select:text; }
+.page svg text { user-select:text; cursor:text; }
 </style>
 </head>
 <body>
@@ -41,7 +41,6 @@ async function loadPages() {
   if (loading) return;
   loading = true;
   try {
-    // Poll until preview_pages.txt exists
     let n = 0;
     while (!n) {
       try {
@@ -94,7 +93,8 @@ async function poll() {
   } catch(e) {}
 }
 
-// Initial load — set lastVer after so poll() doesn't reload immediately
+// Load pages first, capture current version, THEN start polling
+// This prevents poll() firing before lastVer is set and double-loading
 loadPages().then(async () => {
   try {
     const r = await fetch('.preview_version?t=' + Date.now());
@@ -102,12 +102,11 @@ loadPages().then(async () => {
   } catch(e) {}
   status.textContent = '✓ ' + new Date().toLocaleTimeString();
   status.style.color = '#7cb97c';
+  setInterval(poll, 1000);  // only start polling after initial load
 }).catch(e => {
   status.textContent = 'Error: ' + e.message;
   status.style.color = '#e07070';
 });
-
-setInterval(poll, 1000);
 </script>
 </body>
 </html>

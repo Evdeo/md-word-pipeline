@@ -3428,7 +3428,7 @@ body { background:#525659; font-family:sans-serif; }
   width:min(794px, 95vw);
 }
 .page svg { display:block; width:100%; height:auto; }
-.page svg text { user-select:text; }
+.page svg text { user-select:text; cursor:text; }
 </style>
 </head>
 <body>
@@ -3447,7 +3447,6 @@ async function loadPages() {
   if (loading) return;
   loading = true;
   try {
-    // Poll until preview_pages.txt exists
     let n = 0;
     while (!n) {
       try {
@@ -3500,7 +3499,8 @@ async function poll() {
   } catch(e) {}
 }
 
-// Initial load — set lastVer after so poll() doesn't reload immediately
+// Load pages first, capture current version, THEN start polling
+// This prevents poll() firing before lastVer is set and double-loading
 loadPages().then(async () => {
   try {
     const r = await fetch('.preview_version?t=' + Date.now());
@@ -3508,12 +3508,11 @@ loadPages().then(async () => {
   } catch(e) {}
   status.textContent = '\u2713 ' + new Date().toLocaleTimeString();
   status.style.color = '#7cb97c';
+  setInterval(poll, 1000);  // only start polling after initial load
 }).catch(e => {
   status.textContent = 'Error: ' + e.message;
   status.style.color = '#e07070';
 });
-
-setInterval(poll, 1000);
 </script>
 </body>
 </html>"""
@@ -3523,9 +3522,11 @@ setInterval(poll, 1000);
         nonlocal preview_server, preview_observer, preview_url
         import http.server, socketserver, socket, time
 
-        preview_docx = output_dir / "preview.docx"
-        preview_pdf  = output_dir / "preview.pdf"
-        ver_file     = output_dir / ".preview_version"
+        render_dir   = output_dir / "render"
+        render_dir.mkdir(exist_ok=True)
+        preview_docx = render_dir / "preview.docx"
+        preview_pdf  = render_dir / "preview.pdf"
+        ver_file     = render_dir / ".preview_version"
 
         _build_p_running = [False]
 
@@ -3595,7 +3596,7 @@ setInterval(poll, 1000);
                 doc = _mu.open(str(preview_pdf))
                 n   = doc.page_count
 
-                for old in output_dir.glob("preview_page_*.svg"):
+                for old in render_dir.glob("preview_page_*.svg"):
                     try:
                         idx = int(old.stem.split("_")[-1])
                         if idx >= n: old.unlink()
@@ -3631,17 +3632,17 @@ setInterval(poll, 1000);
                     svg_text = page.get_svg_image(text_as_path=0)
                     text_els = _re.findall(r'<text\b.*?</text>', svg_text, _re.DOTALL)
                     if text_els:
-                        overlay = ('<g style="fill:transparent;pointer-events:none;" aria-hidden="true">\n'
+                        overlay = ('<g style="fill:transparent;pointer-events:all;" aria-hidden="true">\n'
                                    + '\n'.join(text_els)
                                    + '\n</g>')
                         svg_visual = svg_visual.rstrip()
                         if svg_visual.endswith('</svg>'):
                             svg_visual = svg_visual[:-6] + '\n' + overlay + '\n</svg>'
 
-                    (output_dir / f"preview_page_{i}.svg").write_text(svg_visual, encoding="utf-8")
+                    (render_dir / f"preview_page_{i}.svg").write_text(svg_visual, encoding="utf-8")
                 doc.close()
 
-                (output_dir / "preview_pages.txt").write_text(str(n), encoding="utf-8")
+                (render_dir / "preview_pages.txt").write_text(str(n), encoding="utf-8")
                 ver_file.write_text(str(time.time()), encoding="utf-8")
                 return True
             except Exception as _e:
@@ -3681,15 +3682,17 @@ setInterval(poll, 1000);
             pass
 
         # Clear stale preview files from previous sessions before starting
-        for _stale in list(output_dir.glob("preview_page_*.svg")) + [
-                       output_dir / "preview_pages.txt",
-                       output_dir / "preview.pdf",
-                       output_dir / "preview.docx",
-                       output_dir / ".preview_version"]:
+        render_dir = output_dir / "render"
+        render_dir.mkdir(exist_ok=True)
+        for _stale in list(render_dir.glob("preview_page_*.svg")) + [
+                       render_dir / "preview_pages.txt",
+                       render_dir / "preview.pdf",
+                       render_dir / "preview.docx",
+                       render_dir / ".preview_version"]:
             try: _stale.unlink()
             except (FileNotFoundError, PermissionError): pass
 
-        (output_dir / "preview.html").write_text(PREVIEW_HTML, encoding="utf-8")
+        (render_dir / "preview.html").write_text(PREVIEW_HTML, encoding="utf-8")
         _build_p()
 
         def _free_port(preferred=None):
@@ -3711,7 +3714,7 @@ setInterval(poll, 1000);
 
         class _SH(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *a, **kw):
-                super().__init__(*a, directory=str(output_dir), **kw)
+                super().__init__(*a, directory=str(render_dir), **kw)
             def log_message(self, *a): pass
             def end_headers(self):
                 # Prevent browser caching so updated SVGs and HTML are always fresh

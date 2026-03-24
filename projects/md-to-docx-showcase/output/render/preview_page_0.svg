@@ -1069,7 +1069,7 @@
 <path transform="matrix(1,0,0,-1,0,792)" d="M545.26 222.41H545.74008V222.88999H545.26Z" fill-rule="evenodd"/>
 </g>
 
-<g style="fill:transparent;pointer-events:none;" aria-hidden="true">
+<g style="fill:transparent;pointer-events:all;" aria-hidden="true">
 <text fill="#1f3864" xml:space="preserve" transform="matrix(1 0 -0 1 0 792)" font-size="32.04" font-family="Calibri" font-weight="bold"><tspan y="-665.5" x="83.784 109.83252 127.038 142.99393 154.1118 171.34932 187.30524 204.38256 221.62007 235.01279 249.81526 257.0563 274.00547 289.83323 306.81443 322.54606 339.75154 347.63337 355.5152 363.39704 374.51493 389.70188 396.81474 411.96965 429.1751 446.41264 470.28245 483.57905 499.4068 512.19076">md_to_docx Capability Showcase</tspan></text>
 <text fill="#1f3864" xml:space="preserve" transform="matrix(1 0 -0 1 0 792)" font-size="21.96" font-family="Calibri" font-weight="bold"><tspan y="-665.5" x="528.34"> </tspan></text>
 <text fill="#1f3864" xml:space="preserve" transform="matrix(1 0 -0 1 0 792)" font-size="32.04" font-family="Calibri"><tspan y="-610.54" x="150.5 167.57732 184.4624 210.06237 226.88336 238.06533 254.02124 270.74613 286.70207 303.52308 316.05073 323.29176 337.77384 353.72978 360.9708 375.67716 391.6331 406.98027 417.61753 434.43855 445.62049 461.57643">Comprehensive Feature </tspan></text>
