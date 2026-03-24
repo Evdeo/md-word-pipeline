@@ -21,7 +21,9 @@ from pathlib import Path
 # where Python is invoked from (current directory, parent, etc.)
 _here = Path(__file__).resolve().parent
 ROOT  = _here if (_here / "lib").exists() else Path.cwd()
-PROJECTS_DIR = ROOT / "projects"
+PROJECTS_DIR  = ROOT / "projects"
+TEMPLATES_DIR = ROOT / "lib" / "templates"
+CONFIGS_DIR   = ROOT / "lib" / "configs"
 sys.path.insert(0, str(ROOT))
 
 
@@ -36,13 +38,20 @@ def _ensure_requirements():
     import_names = {
         "python-docx": "docx", "marko": "marko",
         "pillow": "PIL", "pyyaml": "yaml", "rich": "rich",
+        "pymupdf": "pymupdf", "pywin32": "win32api",
+        "docx2pdf": "docx2pdf", "watchdog": "watchdog",
     }
+    # Packages that only make sense on Windows
+    windows_only = {"pywin32", "docx2pdf"}
     missing = []
     for line in req_path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         pkg = re.split(r"[><=!;\[]", line)[0].strip().lower()
+        # Skip Windows-only packages on non-Windows platforms
+        if pkg in windows_only and sys.platform != "win32":
+            continue
         mod = import_names.get(pkg, pkg.replace("-", "_"))
         try:
             importlib.import_module(mod)
@@ -261,7 +270,7 @@ def _unique_slug(name: str) -> str:
 
 
 
-def _menu(items, title="", extras=None, initial=0):
+def _menu(items, title="", extras=None, initial=0, footer_fn=None):
     """Arrow-key menu. Returns selected index (into non-None items), or a string key.
 
     items:   list of (label, note) tuples, or None for a separator line
@@ -410,23 +419,37 @@ def _menu(items, title="", extras=None, initial=0):
             else:
                 print(f"  [{num:>2}] {padded}{note_str}")
                 num += 1
-        if extras:
-            print(sep)
-            for key, lbl in extras:
+        print(sep)
+        if footer_fn:
+            footer_fn()
+        elif extras:
+            for _e in extras:
+                if _e is None: print(); continue
+                key, lbl = _e
                 print(f"  [{key.upper()}] {lbl}")
         print()
+        # default_sel_num is the 1-based number of the initially highlighted item
+        default_sel_num = next(
+            (si + 1 for si, (orig_i, _) in enumerate(sel_items)
+             if orig_i == initial), 1)
         while True:
             try:
-                raw = input("Select: ").strip().lower()
+                prompt = f"  [{title or 'Select'}] [{default_sel_num}]: " if title else f"  Select [{default_sel_num}]: "
+                raw = input(prompt).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return "q"
+            if raw == "":
+                # Enter with no input → select default
+                return sel_items[default_sel_num - 1][0]
             if raw.isdigit() and 1 <= int(raw) <= len(sel_items):
                 return sel_items[int(raw) - 1][0]
-            for key, _ in extras:
+            for _extra in extras:
+                if _extra is None: continue
+                key, _ = _extra
                 if raw == key.lower():
                     return raw
             print(f"  Enter a number 1–{len(sel_items)}"
-                  + (f" or a letter" if extras else ""))
+                  + (f" or a letter ({', '.join(e[0].upper() for e in extras if e)})" if extras else ""))
 
     if sys.stdin.isatty():
         try:
@@ -461,8 +484,476 @@ def _copy_default_to_project(input_dir: Path) -> None:
     _backup_file(cfg_path)
     cfg_path.write_text(CONFIG_YAML, encoding="utf-8")
 
+
+# ── Template management ────────────────────────────────────────────────────────
+
+def _list_templates() -> list[Path]:
+    """Return templates: default first, rest alphabetical."""
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    tmpls = sorted([d for d in TEMPLATES_DIR.iterdir() if d.is_dir()], key=lambda p: p.name.lower())
+    dflt  = _get_default_template_name()
+    if dflt:
+        tmpls = sorted(tmpls, key=lambda p: (0 if p.name == dflt else 1, p.name.lower()))
+    return tmpls
+
+
+def _template_title(tmpl_dir: Path) -> str:
+    """Read the template display name from document-info.yaml."""
+    try:
+        import yaml
+        info = yaml.safe_load((tmpl_dir / "input" / "document-info.yaml").read_text(encoding="utf-8")) or {}
+        return info.get("document", {}).get("title", tmpl_dir.name)
+    except Exception:
+        return tmpl_dir.name
+
+
+def _template_description(tmpl_dir: Path) -> str:
+    """Read the template description (subtitle) from document-info.yaml."""
+    try:
+        import yaml
+        info = yaml.safe_load((tmpl_dir / "input" / "document-info.yaml").read_text(encoding="utf-8")) or {}
+        return info.get("document", {}).get("subtitle", "")
+    except Exception:
+        return ""
+
+
+def _set_template_meta(tmpl_dir: Path, title: str, description: str) -> None:
+    """Write title and description into the template's document-info.yaml."""
+    import yaml
+    di = tmpl_dir / "input" / "document-info.yaml"
+    try:    data = yaml.safe_load(di.read_text(encoding="utf-8")) or {}
+    except: data = {}
+    data.setdefault("document", {})["title"]    = title
+    data["document"]["subtitle"] = description
+    di.write_text(yaml.dump(data, default_flow_style=False,
+                            allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
+def _run_template(tmpl_dir: Path) -> None:
+    """Open a template for editing — same as a project but output is cleaned up on exit."""
+    import shutil as _sh
+    output_dir = tmpl_dir / "output"
+    try:
+        _run_project(tmpl_dir, is_template=True)
+    finally:
+        # Always clean up build artifacts when done editing
+        if output_dir.exists():
+            try:
+                _sh.rmtree(str(output_dir))
+            except Exception:
+                pass
+
+
+def action_templates() -> None:
+    """Template manager — list, create, edit, rename, copy, delete templates."""
+    import shutil as _sh, yaml as _yaml
+
+    while True:
+        tmpls = _list_templates()
+        _clear()
+        _rule("Templates")
+        _print("")
+
+        dflt_t = _get_default_template_name()
+        items  = [(f"{'★ ' if t.name == dflt_t else ''}{_template_title(t)}",
+                   _template_description(t))
+                  for t in tmpls]
+        extras = [("n", "New template"), ("c", "Copy template"), ("w", "Import from Word"), ("b", "Back")]
+        result = _menu(items, title="Select a template to manage", extras=extras)
+
+        if result == "b":
+            return
+
+        if result == "n":
+            # New blank template
+            _clear()
+            _rule("New Template")
+            _print("")
+            title = _inp("Title", "New Template").strip()
+            if not title: continue
+            desc  = _inp("Description", "").strip()
+            slug  = re.sub(r"[^\w\s-]", "", title.lower())
+            slug  = re.sub(r"[\s_]+", "-", slug).strip("-") or "template"
+            dest  = TEMPLATES_DIR / slug
+            if dest.exists():
+                _print(f"\n[red]  A template named '{slug}' already exists.[/red]\n"
+                       if HAS_RICH else f"\n  Template '{slug}' already exists.\n")
+                _pause(); continue
+            dest.mkdir(parents=True)
+            (dest / "input").mkdir()
+            (dest / "input" / "images").mkdir()
+            _create_project_files(dest, title, "", "1.0", "", "minimal")
+            _set_template_meta(dest, title, desc)
+            _print(f"\n[green]  ✓ Template '{title}' created.[/green]\n"
+                   if HAS_RICH else f"\n  Template '{title}' created.\n")
+            _pause(); continue
+
+        if result == "c":
+            # Copy an existing template
+            if not tmpls:
+                _print("\n[yellow]  No templates to copy from.[/yellow]\n"
+                       if HAS_RICH else "\n  No templates.\n")
+                _pause(); continue
+            _clear()
+            _rule("Copy Template")
+            copy_items = [(t.name, _template_title(t)) for t in tmpls]
+            src_result = _menu(copy_items, title="Select template to copy", extras=[("b", "Back")])
+            if src_result == "b" or not isinstance(src_result, int):
+                continue
+            src   = tmpls[src_result]
+            title = _inp("Title", _template_title(src)).strip()
+            if not title: continue
+            desc  = _inp("Description", _template_description(src)).strip()
+            slug  = re.sub(r"[^\w\s-]", "", title.lower())
+            slug  = re.sub(r"[\s_]+", "-", slug).strip("-") or "template"
+            dest  = TEMPLATES_DIR / slug
+            if dest.exists():
+                _print(f"\n[red]  A template named '{slug}' already exists.[/red]\n"
+                       if HAS_RICH else f"\n  Template '{slug}' already exists.\n")
+                _pause(); continue
+            _sh.copytree(str(src / "input"), str(dest / "input"))
+            (dest / "input" / "images").mkdir(exist_ok=True)
+            _set_template_meta(dest, title, desc)
+            _print(f"\n[green]  ✓ Copied to '{title}'.[/green]\n"
+                   if HAS_RICH else f"\n  Copied to '{title}'.\n")
+            _pause(); continue
+
+        if result == "w":
+            _clear()
+            _rule("Import Word File as Template")
+            _print("")
+            name = _inp("Template name", "New Template").strip()
+            if not name:
+                continue
+            desc = _inp("Description", "").strip()
+            slug = re.sub(r"[^\w\s-]", "", name.lower())
+            slug = re.sub(r"[\s_]+", "-", slug).strip("-") or "template"
+            dest = TEMPLATES_DIR / slug
+            if dest.exists():
+                _print(f"\n[red]  A template named '{slug}' already exists.[/red]\n"
+                       if HAS_RICH else f"\n  Template '{slug}' already exists.\n")
+                _pause(); continue
+            wp = _pick_docx_file()
+            if not wp:
+                _pause(); continue
+            dest.mkdir(parents=True)
+            (dest / "input").mkdir()
+            (dest / "input" / "images").mkdir()
+            _create_project_files(dest, name, "", "1.0", "", "minimal")
+            _bootstrap_from_docx(wp, dest / "input")
+            _set_template_meta(dest, name, desc)
+            _print(f"\n[green]  ✓ Template '{name}' created from Word file.[/green]\n"
+                   if HAS_RICH else f"\n  Template '{name}' created.\n")
+            _pause(); continue
+
+        if isinstance(result, int):
+            tmpl = tmpls[result]
+            # Template action menu
+            while True:
+                _clear()
+                _rule(f"Template: {_template_title(tmpl)}")
+                _print("")
+                dflt_tmpl = _get_default_template_name()
+                star = "★ " if tmpl.name == dflt_tmpl else ""
+                act = _menu([
+                    ("Edit",           "open and edit this template with live preview"),
+                    ("Set as default", "use this as the default template for new projects"),
+                    ("Rename",         "rename this template"),
+                    ("Delete",         "permanently delete this template"),
+                ], title=f"{star}{tmpl.name}", extras=[("b", "Back")])
+
+                if act == "b":
+                    break
+
+                if act == 0:  # Edit
+                    _run_template(tmpl)
+                    break
+
+                if act == 1:  # Set as default
+                    _set_default_template_name(tmpl.name)
+                    _print(f"\n[green]  ★ '{tmpl.name}' is now the default template.[/green]\n"
+                           if HAS_RICH else f"\n  '{tmpl.name}' set as default.\n")
+                    _pause(); continue
+
+                if act == 2:  # Rename
+                    new_name = _inp("New name", tmpl.name).strip()
+                    if not new_name or new_name == tmpl.name:
+                        continue
+                    new_slug = re.sub(r"[^\w\s-]", "", new_name.lower())
+                    new_slug = re.sub(r"[\s_]+", "-", new_slug).strip("-") or tmpl.name
+                    new_dest = TEMPLATES_DIR / new_slug
+                    if new_dest.exists():
+                        _print(f"\n[red]  '{new_slug}' already exists.[/red]\n"
+                               if HAS_RICH else f"\n  '{new_slug}' already exists.\n")
+                        _pause(); continue
+                    tmpl.rename(new_dest)
+                    _print(f"\n[green]  ✓ Renamed.[/green]\n" if HAS_RICH else "\n  Renamed.\n")
+                    _pause(); break
+
+                if act == 3:  # Delete
+                    confirm = _inp(f"Type '{tmpl.name}' to confirm deletion", "").strip()
+                    if confirm == tmpl.name:
+                        import shutil as _sh2
+                        _sh2.rmtree(str(tmpl))
+                        _print(f"\n[green]  ✓ Deleted.[/green]\n" if HAS_RICH else "\n  Deleted.\n")
+                        _pause(); break
+
+
+# ── Config management ──────────────────────────────────────────────────────────
+
+def _list_configs() -> list[Path]:
+    """Return configs: default first, rest alphabetical."""
+    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    all_cfgs = sorted([f for f in CONFIGS_DIR.iterdir()
+                       if f.is_file() and f.suffix == ".yaml"],
+                      key=lambda p: p.stem.lower())
+    dflt = _get_default_config_name()
+    if dflt:
+        all_cfgs = sorted(all_cfgs, key=lambda p: (0 if p.stem == dflt else 1, p.stem.lower()))
+    return all_cfgs
+
+
+def _get_default_template_name() -> str:
+    """Read which template is marked as default."""
+    marker = TEMPLATES_DIR / ".default"
+    try:    return marker.read_text(encoding="utf-8").strip()
+    except: return ""
+
+
+def _set_default_template_name(name: str) -> None:
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    (TEMPLATES_DIR / ".default").write_text(name, encoding="utf-8")
+
+
+def _get_default_config_name() -> str:
+    """Read which config is marked as default."""
+    marker = CONFIGS_DIR / ".default"
+    try:    return marker.read_text(encoding="utf-8").strip()
+    except: return ""
+
+
+def _set_default_config_name(name: str) -> None:
+    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    (CONFIGS_DIR / ".default").write_text(name, encoding="utf-8")
+
+
+def _load_named_config(name: str) -> str:
+    """Return YAML text for a named config, falling back to CONFIG_YAML."""
+    p = CONFIGS_DIR / f"{name}.yaml"
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+    return CONFIG_YAML
+
+
+def action_configs() -> None:
+    """Config manager — list, create, edit, set default, rename, delete configs."""
+    import shutil as _sh, yaml as _yaml
+
+    while True:
+        cfgs    = _list_configs()
+        default = _get_default_config_name()
+        _clear()
+        _rule("Configs")
+        _print("")
+
+        items = []
+        for c in cfgs:
+            star = "★ " if c.stem == default else ""
+            meta_f = CONFIGS_DIR / f"{c.stem}.meta"
+            desc   = meta_f.read_text(encoding="utf-8").strip() if meta_f.exists() else ""
+            items.append((f"{star}{c.stem}", desc))
+        extras = [("n", "New config"), ("c", "Copy config"), ("w", "Import from Word"), ("b", "Back")]
+        result = _menu(items, title="Select a config to manage", extras=extras)
+
+        if result == "b":
+            return
+
+        if result == "n":
+            _clear()
+            _rule("New Config")
+            _print("")
+            name = _inp("Config name", "New Config").strip()
+            if not name: continue
+            desc = _inp("Description", "").strip()
+            slug = re.sub(r"[^\w\s-]", "", name.lower())
+            slug = re.sub(r"[\s_]+", "-", slug).strip("-") or "config"
+            dest = CONFIGS_DIR / f"{slug}.yaml"
+            if dest.exists():
+                _print(f"\n[red]  A config named '{slug}' already exists.[/red]\n"
+                       if HAS_RICH else f"\n  Config '{slug}' already exists.\n")
+                _pause(); continue
+            dest.write_text(_load_named_config(_get_default_config_name()), encoding="utf-8")
+            if desc: (CONFIGS_DIR / f"{slug}.meta").write_text(desc, encoding="utf-8")
+            _print(f"\n[green]  ✓ Config '{name}' created.[/green]\n"
+                   if HAS_RICH else f"\n  Config '{name}' created.\n")
+            _pause(); continue
+
+        if result == "c":
+            if not cfgs:
+                _print("\n[yellow]  No configs to copy from.[/yellow]\n"
+                       if HAS_RICH else "\n  No configs.\n")
+                _pause(); continue
+            _clear()
+            _rule("Copy Config")
+            dflt_c     = _get_default_config_name()
+            copy_items = [(f"{'★ ' if c.stem == dflt_c else ''}{c.stem}", "") for c in cfgs]
+            src_r      = _menu(copy_items, title="Select config to copy", extras=[("b", "Back")])
+            if not isinstance(src_r, int):
+                continue
+            src_cfg = cfgs[src_r]
+            name    = _inp("New config name", "").strip()
+            if not name:
+                continue
+            slug = re.sub(r"[^\w\s-]", "", name.lower())
+            slug = re.sub(r"[\s_]+", "-", slug).strip("-") or "config"
+            dest = CONFIGS_DIR / f"{slug}.yaml"
+            if dest.exists():
+                _print(f"\n[red]  A config named '{slug}' already exists.[/red]\n"
+                       if HAS_RICH else f"\n  Config '{slug}' already exists.\n")
+                _pause(); continue
+            desc_input = _inp("Description", "").strip()
+            import shutil as _sh_c
+            _sh_c.copy2(str(src_cfg), str(dest))
+            src_meta = CONFIGS_DIR / f"{src_cfg.stem}.meta"
+            if desc_input:
+                (CONFIGS_DIR / f"{slug}.meta").write_text(desc_input, encoding="utf-8")
+            elif src_meta.exists():
+                _sh_c.copy2(str(src_meta), str(CONFIGS_DIR / f"{slug}.meta"))
+            _print(f"\n[green]  ✓ Copied '{src_cfg.stem}' to '{name}'.[/green]\n"
+                   if HAS_RICH else f"\n  Copied to '{name}'.\n")
+            _pause(); continue
+
+        if result == "w":
+            # Import styles from a Word file into a new config
+            _clear()
+            _rule("Import Styles from Word")
+            _print("")
+            name = _inp("Config name", "New Config").strip()
+            if not name: continue
+            desc = _inp("Description", "").strip()
+            slug = re.sub(r"[^\w\s-]", "", name.lower())
+            slug = re.sub(r"[\s_]+", "-", slug).strip("-") or "config"
+            dest = CONFIGS_DIR / f"{slug}.yaml"
+            if dest.exists():
+                _print(f"\n[red]  A config named '{slug}' already exists.[/red]\n"
+                       if HAS_RICH else f"\n  Config '{slug}' already exists.\n")
+                _pause(); continue
+            wp = _pick_docx_file()
+            if not wp:
+                _pause(); continue
+            # Write default config to a temp dir, apply styles, copy result to dest
+            import tempfile as _tf_ci, shutil as _sh_ci
+            with _tf_ci.TemporaryDirectory() as _tdir:
+                _tcfg = Path(_tdir) / "config.yaml"
+                _tcfg.write_text(_load_named_config(_get_default_config_name()), encoding="utf-8")
+                _apply_template_to_config(wp, Path(_tdir))
+                dest.write_text(_tcfg.read_text(encoding="utf-8"), encoding="utf-8")
+            if desc: (CONFIGS_DIR / f"{slug}.meta").write_text(desc, encoding="utf-8")
+            _print(f"\n[green]  ✓ Config '{name}' created with styles from Word file.[/green]\n"
+                   if HAS_RICH else f"\n  Config '{name}' created.\n")
+            _pause(); continue
+
+        if isinstance(result, int):
+            cfg = cfgs[result]
+            default = _get_default_config_name()
+            while True:
+                _clear()
+                star = "★ " if cfg.stem == default else ""
+                _rule(f"Config: {star}{cfg.stem}")
+                _print("")
+                act_items = [
+                    ("Edit fields",    "browse and edit every setting field by field"),
+                    ("Inspect styles", "extract styles from a Word file into this config"),
+                    ("Set as default", "use this config for new projects and templates"),
+                    ("Rename",         "rename this config"),
+                    ("Delete",         "permanently delete this config"),
+                ]
+                act = _menu(act_items, title=cfg.stem, extras=[("b", "Back")])
+
+                if act == "b":
+                    break
+
+                if act == 0:  # Edit fields
+                    import yaml as _yaml
+                    try:
+                        cfg_data = _yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+                    except Exception as e:
+                        _print(f"[red]  Could not read config: {e}[/red]"); _pause(); continue
+                    flat    = dict(_flatten_yaml(cfg_data))
+                    pending = {}
+                    # Reuse the existing field editor — save to this config file
+                    fake_state = {"input_dir": cfg.parent}
+                    # Temporarily write config to a temp project-style path
+                    import tempfile as _tf, shutil as _sh2
+                    with _tf.TemporaryDirectory() as tmp:
+                        tmp_input = Path(tmp) / "input"
+                        tmp_input.mkdir()
+                        _sh2.copy2(str(cfg), str(tmp_input / "config.yaml"))
+                        fake_state = {"input_dir": tmp_input}
+                        action_edit_config(fake_state)
+                        # Copy edited config back
+                        edited = tmp_input / "config.yaml"
+                        if edited.exists():
+                            _sh2.copy2(str(edited), str(cfg))
+                    continue
+
+                if act == 1:  # Inspect styles
+                    import tempfile as _tf2, shutil as _sh3
+                    wp = _pick_docx_file()
+                    if not wp:
+                        _pause(); continue
+                    with _tf2.TemporaryDirectory() as _tmp2:
+                        _tmp_input = Path(_tmp2) / "input"
+                        _tmp_input.mkdir()
+                        _sh3.copy2(str(cfg), str(_tmp_input / "config.yaml"))
+                        fake_s = {"input_dir": _tmp_input, "output_dir": Path(_tmp2) / "output", "proj_dir": Path(_tmp2)}
+                        fake_s["output_dir"].mkdir()
+                        action_inspect(fake_s)
+                        _sh3.copy2(str(_tmp_input / "config.yaml"), str(cfg))
+                    continue
+
+                if act == 2:  # Set as default
+                    _set_default_config_name(cfg.stem)
+                    default = cfg.stem
+                    _print(f"\n[green]  ★ '{cfg.stem}' is now the default config.[/green]\n"
+                           if HAS_RICH else f"\n  '{cfg.stem}' set as default.\n")
+                    _pause(); continue
+
+                if act == 3:  # Rename
+                    new_name = _inp("New name", cfg.stem).strip()
+                    if not new_name or new_name == cfg.stem:
+                        continue
+                    new_slug = re.sub(r"[^\w\s-]", "", new_name.lower())
+                    new_slug = re.sub(r"[\s_]+", "-", new_slug).strip("-") or cfg.stem
+                    new_dest = CONFIGS_DIR / f"{new_slug}.yaml"
+                    if new_dest.exists():
+                        _print(f"\n[red]  '{new_slug}' already exists.[/red]\n"
+                               if HAS_RICH else f"\n  '{new_slug}' already exists.\n")
+                        _pause(); continue
+                    cfg.rename(new_dest)
+                    if default == cfg.stem:
+                        _set_default_config_name(new_slug)
+                    _print(f"\n[green]  ✓ Renamed.[/green]\n" if HAS_RICH else "\n  Renamed.\n")
+                    _pause(); break
+
+                if act == 4:  # Delete
+                    if cfg.stem == default:
+                        _print("\n[red]  Cannot delete the default config.[/red]\n"
+                               if HAS_RICH else "\n  Cannot delete the default config.\n")
+                        _pause(); continue
+                    confirm = _inp(f"Type '{cfg.stem}' to confirm deletion", "").strip()
+                    if confirm == cfg.stem:
+                        cfg.unlink()
+                        _print(f"\n[green]  ✓ Deleted.[/green]\n" if HAS_RICH else "\n  Deleted.\n")
+                        _pause(); break
+                    else:
+                        _print("\n[yellow]  Cancelled.[/yellow]\n" if HAS_RICH else "\n  Cancelled.\n")
+                        _pause()
+
+
 def _show_picker(projects: list[Path]) -> str | None:
-    """Project picker with change indicators."""
+    """Project picker with change indicators and two-column footer."""
+    import shutil as _sh
     last = _load_last()
     initial = 0
     for i, p in enumerate(projects):
@@ -475,7 +966,7 @@ def _show_picker(projects: list[Path]) -> str | None:
         title   = info["title"]
         if len(title) > 28: title = title[:27] + "…"
         version = (f"v{info['version']}" if info["version"] else "")[:7]
-        author  = (info["author"]         if info["author"]  else "")[:20]
+        author  = (info["author"]          if info["author"]  else "")[:20]
         age     = _file_age(proj / "input")[:10]
 
         linked_file = _get_linked_file(proj / "output")
@@ -492,19 +983,53 @@ def _show_picker(projects: list[Path]) -> str | None:
         items.append((title, f"{status_str}{version:<8}{author:<21}{age}"))
 
     _clear()
-    n_arch = len(_archived_projects())
-    arch_label = f"Archive a project  ({n_arch} archived)" if n_arch else "Archive a project"
-    picker_extras = [("a", "New project"), ("s", arch_label)]
+    n_arch     = len(_archived_projects())
+    arch_label = f"Archive  ({n_arch} archived)" if n_arch else "Archive a project"
+
+    # Left column: project actions  |  Right column: library
+    left  = [("a", "New project"), ("s", "New project from Word"), ("d", arch_label)]
     if n_arch:
-        picker_extras.append(("f", "Unarchive a project"))
-    picker_extras.append(("d", "Change default config"))
-    picker_extras.append(("q", "Quit"))
+        left.append(("f", "Unarchive a project"))
+    right = [("t", "Templates"), ("c", "Configs")]
+
+    # Build combined extras: paired rows rendered as two columns
+    # Pass as a flat list — _menu will render them, we need custom footer
+    # Use a custom extras list with spacing trick
+    w         = _sh.get_terminal_size((80, 24)).columns
+    col_width = max(w // 2 - 4, 30)
+    paired    = []
+    max_rows  = max(len(left), len(right))
+    for i in range(max_rows):
+        l = f"  [{left[i][0].upper()}] {left[i][1]}"  if i < len(left)  else ""
+        r = f"  [{right[i][0].upper()}] {right[i][1]}" if i < len(right) else ""
+        paired.append((l, r, col_width))
+
+    # We render the footer ourselves after _menu by wrapping the display
+    # Pass extras normally so key handling works, but use a custom renderer
+    all_extras = left + [("q", "Quit")] + right
 
     result = _menu(items, title="Select a project",
-                   extras=picker_extras, initial=initial)
+                   extras=all_extras, initial=initial,
+                   footer_fn=lambda: _picker_footer(left, right, [("q", "Quit")]))
     if isinstance(result, int):
         return projects[result].name
     return result
+
+
+def _picker_footer(left: list, right: list, bottom: list) -> None:
+    """Print two-column footer for the project picker."""
+    import shutil as _sh
+    w         = _sh.get_terminal_size((80, 24)).columns
+    col_width = max(w // 4 + 4, 22)
+    print()
+    max_rows = max(len(left), len(right))
+    for i in range(max_rows):
+        l = f"  [{left[i][0].upper()}] {left[i][1]}"  if i < len(left)  else ""
+        r = f"  [{right[i][0].upper()}] {right[i][1]}" if i < len(right) else ""
+        print(f"{l:<{col_width}}{r}")
+    print()
+    for key, lbl in bottom:
+        print(f"  [{key.upper()}] {lbl}")
 
 def _show_dashboard(state: dict):
     """Compact running view status panel."""
@@ -2430,35 +2955,135 @@ def action_unarchive_project():
 
 
 
-def action_new_project():
-    """Interactively create a new project."""
-    _rule("New Project")
-    _print("")
+def _pick_config():
+    """Let user pick a saved config. Returns yaml text, or None if cancelled."""
+    saved_cfgs  = _list_configs()
+    default_cfg = _get_default_config_name()
+    cfg_items   = []
+    if default_cfg:
+        cfg_items.append((f"★ {default_cfg}", "default"))
+    for c in saved_cfgs:
+        if c.stem != default_cfg:
+            cfg_items.append((c.stem, ""))
+    if not cfg_items:
+        cfg_items.append(("Built-in default", ""))
+    cfg_result = _menu(cfg_items, title="Select config", initial=0)
+    if not isinstance(cfg_result, int):
+        return None
+    if cfg_result == 0 and default_cfg:
+        return _load_named_config(default_cfg)
+    elif cfg_result == 0:
+        return CONFIG_YAML
+    non_defaults = [c for c in saved_cfgs if c.stem != default_cfg]
+    idx = cfg_result - (1 if default_cfg else 0)
+    return non_defaults[idx].read_text(encoding="utf-8") if idx < len(non_defaults) else CONFIG_YAML
 
-    title = _inp("Project title", "Untitled")
-    if not title.strip():
-        _pause(); return
 
-    author         = _inp("Author", _get_last_author())
-    version        = _inp("Version", "1.0")
-    classification = _inp("Classification", _get_last_classification())
-
-    templates = ["minimal", "full"]
-    _print("\nTemplate:")
-    for i, t in enumerate(templates, 1):
-        _print(f"  [{i}] {t}")
-    raw = _inp("\nSelect template", "1").strip()
-    try:    tmpl_idx = int(raw) - 1
-    except: tmpl_idx = 0
-    template = templates[tmpl_idx] if 0 <= tmpl_idx < len(templates) else "minimal"
-
+def _finalise_project(title, author, version, classification,
+                      cfg_yaml, tmpl_src_dir=None, docx_source=None):
+    """Create project folder and files, apply config."""
+    import shutil as _sh_np
     slug     = _unique_slug(title)
     proj_dir = PROJECTS_DIR / slug
-    _create_project_files(proj_dir, title, author, version, classification, template)
-
-    _print(f"\n[green]Created: {proj_dir}[/green]\n" if HAS_RICH
+    if tmpl_src_dir:
+        _sh_np.copytree(str(tmpl_src_dir), str(proj_dir / "input"))
+        (proj_dir / "input" / "images").mkdir(exist_ok=True)
+        (proj_dir / "output").mkdir(parents=True, exist_ok=True)
+        (proj_dir / "input" / "document-info.yaml").write_text(
+            _document_info_yaml(title, author, version, classification), encoding="utf-8")
+    else:
+        _create_project_files(proj_dir, title, author, version, classification,
+                              "minimal", docx_source=docx_source)
+    (proj_dir / "input" / "config.yaml").write_text(cfg_yaml, encoding="utf-8")
+    _print(f"\n[green]✓ Created: {proj_dir}[/green]\n" if HAS_RICH
            else f"\n  Created: {proj_dir}\n")
     _pause()
+
+
+def action_new_project():
+    """New project: info → pick template → pick config."""
+    _rule("New Project")
+    _print("")
+    title = _inp("Project title", "Untitled")
+    if not title.strip(): _pause(); return
+    author         = _inp("Author",         _get_last_author())
+    version        = _inp("Version",        "1.0")
+    classification = _inp("Classification", _get_last_classification())
+
+    saved_tmpls = _list_templates()
+    if not saved_tmpls:
+        _print("\n[yellow]  No templates found. Create one via [T] Templates first.[/yellow]\n"
+               if HAS_RICH else "\n  No templates found — create one in Templates first.\n")
+        _pause(); return
+
+    dflt       = _get_default_template_name()
+    dflt_idx   = 0  # default is always sorted first
+    tmpl_items = [(f"{'★ ' if t.name==dflt else ''}{_template_title(t)}",
+                   _template_description(t))
+                  for t in saved_tmpls]
+    src = _menu(tmpl_items, title="Select template", initial=dflt_idx)
+    if not isinstance(src, int): return
+
+    cfg_yaml = _pick_config()
+    if cfg_yaml is None: return
+
+    _finalise_project(title, author, version, classification,
+                      cfg_yaml, tmpl_src_dir=saved_tmpls[src] / "input")
+
+
+def _pick_docx_file() -> 'Path | None':
+    """Open a file dialog to select a .docx file. Falls back to text input."""
+    try:
+        import tkinter as _tk
+        from tkinter import filedialog as _fd
+        root = _tk.Tk()
+        root.withdraw()
+        root.lift()
+        root.attributes("-topmost", True)
+        root.focus_force()
+        path = _fd.askopenfilename(
+            title="Select a Word file",
+            filetypes=[("Word documents", "*.docx"), ("All files", "*.*")])
+        root.destroy()
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists() or p.suffix.lower() != ".docx":
+            _print(f"\n[red]  Not a .docx file: {p}[/red]\n" if HAS_RICH
+                   else f"\n  Not a .docx: {p}\n")
+            return None
+        return p
+    except Exception:
+        _print("\n  Enter the full path to your Word file:")
+        try:    raw = input("  Path: ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt): return None
+        p = Path(raw.strip())
+        if not p.exists() or p.suffix.lower() != ".docx":
+            _print(f"\n[red]  File not found: {p}[/red]\n" if HAS_RICH
+                   else f"\n  File not found: {p}\n")
+            return None
+        return p
+
+
+def action_new_project_from_word():
+    """New project from Word: info → pick file → pick config."""
+    _rule("New Project from Word")
+    _print("")
+    title = _inp("Project title", "Untitled")
+    if not title.strip(): _pause(); return
+    author         = _inp("Author",         _get_last_author())
+    version        = _inp("Version",        "1.0")
+    classification = _inp("Classification", _get_last_classification())
+
+    docx_source = _pick_docx_file()
+    if not docx_source:
+        _pause(); return
+
+    cfg_yaml = _pick_config()
+    if cfg_yaml is None: return
+
+    _finalise_project(title, author, version, classification,
+                      cfg_yaml, docx_source=docx_source)
 
 # -- Document actions -----------------------------------------------
 
@@ -2541,16 +3166,6 @@ def action_build(state: dict):
 
 
 
-def _add_revision(input_dir: Path, new_version: str,
-                   author: str, changes: str) -> bool:
-    """Add a revision entry to document-info.yaml and update the version field.
-
-    Returns True if the file was updated.
-    """
-    import yaml
-    di_path = input_dir / "document-info.yaml"
-    if not di_path.exists():
-        return False
     try:
         data = yaml.safe_load(di_path.read_text(encoding="utf-8")) or {}
     except Exception:
@@ -2980,10 +3595,6 @@ def action_open_document(state: dict):
     _pause()
 
 
-def action_open_vscode(state: dict):
-    _print(f"\nOpening [cyan]projects/{state['proj_dir'].name}/[/cyan] in VS Code…")
-    _open_vscode(state["proj_dir"])
-    _pause()
 
 
 def action_edit_info(state: dict):
@@ -3240,6 +3851,234 @@ def _apply_template_to_config(docx_path: Path, input_dir: Path):
 
 # ── project runner ─────────────────────────────────────────────────────────────
 
+def _save_project_config(cfg_path, cfg):
+    """Write cfg dict to config.yaml."""
+    import yaml as _yaml
+    _backup_file(cfg_path)
+    cfg_path.write_text(
+        _yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False),
+        encoding="utf-8")
+
+
+def _edit_project_config_category(cat_name: str, fields: list,
+                                   cfg_path, cfg, undo_stack: list):
+    """Edit fields in a category with instant apply and undo support."""
+    import yaml as _yaml
+    import shutil as _sh
+
+    flat = dict(_flatten_yaml(cfg))
+    i = 0
+    while i < len(fields):
+        key  = fields[i]
+        meta = _FIELD_META.get(key, ("", "No description available."))
+        desc = meta[1]
+        val  = str(flat.get(key, ""))
+
+        w   = _sh.get_terminal_size((80, 24)).columns
+        sep = "\u2500" * min(w - 2, 70)
+
+        _clear()
+        _rule(f"{cat_name}  \u2014  field {i + 1} of {len(fields)}")
+        print()
+        print(f"  {key}")
+        print(f"  {sep}")
+
+        # Word-wrap description
+        words = desc.split()
+        line  = "  "
+        for word in words:
+            if len(line) + len(word) + 1 > w - 2:
+                print(line); line = "  " + word
+            else:
+                line = (line + " " + word) if line.strip() else "  " + word
+        if line.strip(): print(line)
+
+        print()
+        print(f"  {sep}")
+        print()
+        print("  [Enter]  Keep and go to next field")
+        print("  [U]      Undo last change")
+        print("  [B]      Back to categories")
+        print()
+
+        try:
+            raw = input(f"  {key} [{val}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if raw.lower() == "b":
+            return
+        elif raw.lower() == "u":
+            if undo_stack:
+                prev_key, prev_val = undo_stack.pop()
+                try:    parsed = _yaml.safe_load(str(prev_val))
+                except: parsed = str(prev_val)
+                cfg = _set_nested(cfg, prev_key, parsed)
+                flat = dict(_flatten_yaml(cfg))
+                _save_project_config(cfg_path, cfg)
+                # Update cfg reference in caller via mutation
+                cfg_path.write_text(
+                    _yaml.dump(cfg, default_flow_style=False,
+                               allow_unicode=True, sort_keys=False),
+                    encoding="utf-8")
+                _print(f"\n  [green]\u2713 Undone: {prev_key} restored to {prev_val}[/green]\n"
+                       if HAS_RICH else f"\n  Undone: {prev_key} = {prev_val}\n")
+                import time; time.sleep(0.6)
+            else:
+                _print("\n  [yellow]Nothing to undo.[/yellow]\n"
+                       if HAS_RICH else "\n  Nothing to undo.\n")
+                import time; time.sleep(0.6)
+            # Stay on same field — reload val
+            flat = dict(_flatten_yaml(
+                _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}))
+        elif raw == "":
+            # Keep — advance to next field
+            i += 1
+        else:
+            # New value — apply instantly
+            old_val = flat.get(key, "")
+            undo_stack.append((key, old_val))
+            try:    parsed = _yaml.safe_load(raw)
+            except: parsed = raw
+            cfg = _set_nested(cfg, key, parsed)
+            flat = dict(_flatten_yaml(cfg))
+            _save_project_config(cfg_path, cfg)
+            # Stay on same field so user can see the result
+            _print(f"\n  [green]\u2713 {key} = {raw}[/green]\n"
+                   if HAS_RICH else f"\n  {key} = {raw}\n")
+            import time; time.sleep(0.5)
+
+
+def action_edit_config(state: dict) -> None:
+    """Browse and edit every field in this project's config.yaml.
+    Changes are applied instantly and synced to the live preview.
+    Full session undo is available with R from the category screen."""
+    import yaml as _yaml
+
+    cfg_path = state["input_dir"] / "config.yaml"
+    try:
+        cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        _print(f"[red]  Could not read config.yaml: {e}[/red]")
+        _pause(); return
+
+    # undo_stack: list of (key, old_value) tuples — grows across the whole session
+    undo_stack = []
+
+    while True:
+        cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        flat = dict(_flatten_yaml(cfg))
+
+        _clear()
+        _rule("Edit Project Config")
+        _print("")
+        _print("  Changes apply instantly to the live preview.\n")
+
+        items = []
+        for cat in _CATEGORY_ORDER:
+            fields = [k for k in flat if _FIELD_META.get(k, ("",))[0] == cat]
+            if not fields: continue
+            items.append((cat, f"{len(fields)} fields"))
+
+        result = _menu(items,
+                       title="Select a category",
+                       extras=[("r", "Undo all session changes"),
+                                ("b", "Back to More menu")])
+
+        if result == "b":
+            return
+
+        if result == "r":
+            if not undo_stack:
+                _print("\n[yellow]  Nothing to undo.[/yellow]\n"
+                       if HAS_RICH else "\n  Nothing to undo.\n")
+                _pause(); continue
+            # Replay undo stack in reverse
+            for key, old_val in reversed(undo_stack):
+                try:    parsed = _yaml.safe_load(str(old_val))
+                except: parsed = str(old_val)
+                cfg = _set_nested(cfg, key, parsed)
+            _save_project_config(cfg_path, cfg)
+            undo_stack.clear()
+            _print("\n[green]  \u2713 All session changes reverted.[/green]\n"
+                   if HAS_RICH else "\n  All session changes reverted.\n")
+            _pause(); continue
+
+        if isinstance(result, int):
+            cat_name = items[result][0]
+            fields   = [k for k in flat if _FIELD_META.get(k, ("",))[0] == cat_name]
+            _edit_project_config_category(cat_name, fields, cfg_path, cfg, undo_stack)
+
+
+
+def _copy_named_config_to_project(state: dict) -> None:
+    """Let user pick a saved config and copy it into this project."""
+    cfgs = _list_configs()
+    if not cfgs:
+        _print("\n[yellow]  No saved configs yet. Use \'Save as config\' first.[/yellow]\n"
+               if HAS_RICH else "\n  No saved configs yet.\n")
+        _pause(); return
+    _clear()
+    _rule("Copy Config to Project")
+    _print("")
+    default = _get_default_config_name()
+    items = []
+    for c in cfgs:
+        star = "★ " if c.stem == default else ""
+        items.append((f"{star}{c.stem}", ""))
+    result = _menu(items, title="Select config to copy", extras=[("b", "Back")])
+    if not isinstance(result, int):
+        return
+    chosen = cfgs[result]
+    import shutil as _sh
+    _sh.copy2(str(chosen), str(state["input_dir"] / "config.yaml"))
+    _print(f"\n[green]  ✓ Config '{chosen.stem}' applied to this project.[/green]\n"
+           if HAS_RICH else f"\n  Config '{chosen.stem}' applied.\n")
+    _pause()
+
+
+def _save_project_as_config(state: dict) -> None:
+    """Snapshot this project's config.yaml as a named reusable config."""
+    _print("\n")
+    name = _inp("Config name", "").strip()
+    if not name:
+        _pause(); return
+    slug = re.sub(r"[^\w\s-]", "", name.lower())
+    slug = re.sub(r"[\s_]+", "-", slug).strip("-") or "config"
+    dest = CONFIGS_DIR / f"{slug}.yaml"
+    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        _print(f"\n[red]  A config named '{slug}' already exists.[/red]\n"
+               if HAS_RICH else f"\n  Config '{slug}' already exists.\n")
+        _pause(); return
+    import shutil as _sh
+    _sh.copy2(str(state["input_dir"] / "config.yaml"), str(dest))
+    _print(f"\n[green]  ✓ Config '{name}' saved.[/green]\n"
+           if HAS_RICH else f"\n  Config '{name}' saved.\n")
+    _pause()
+
+
+def _save_project_as_template(state: dict) -> None:
+    """Snapshot this project's input/ as a named reusable template."""
+    _print("\n")
+    name = _inp("Template name", "").strip()
+    if not name:
+        _pause(); return
+    slug = re.sub(r"[^\w\s-]", "", name.lower())
+    slug = re.sub(r"[\s_]+", "-", slug).strip("-") or "template"
+    dest = TEMPLATES_DIR / slug
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        _print(f"\n[red]  A template named '{slug}' already exists.[/red]\n"
+               if HAS_RICH else f"\n  Template '{slug}' already exists.\n")
+        _pause(); return
+    import shutil as _sh
+    _sh.copytree(str(state["input_dir"]), str(dest / "input"))
+    _print(f"\n[green]  ✓ Template '{name}' saved.[/green]\n"
+           if HAS_RICH else f"\n  Template '{name}' saved.\n")
+    _pause()
+
+
 def _action_more(state: dict) -> None:
     """More menu — Document and Config categories."""
 
@@ -3265,22 +4104,21 @@ def _action_more(state: dict) -> None:
 
     CATEGORIES = [
         ("Document", [
-            ("Export",          "save Word file to a chosen location", action_export),
-            ("Open Word file",  "open the built document",             action_open_document),
-            ("Link file",       "set or update the file to compare against", action_link_file),
-            ("Review changes",  "section-by-section diff vs linked file",    action_sync),
+            ("Export",         "save Word file to a chosen location",          action_export),
+            ("Link file",      "set or update the file to compare against",    action_link_file),
+            ("Review changes", "section-by-section diff vs linked file",       action_sync),
         ]),
         ("Config", [
-            ("Edit info",           "title, author, version, classification", action_edit_info),
-            ("Edit properties",     "{{placeholder}} values",                 action_edit_properties),
-            ("Inspect template",    "extract styles from a Word file",        action_inspect),
-            ("Copy default config", "replace this project's config with the default",
-             lambda s: (
-                 _copy_default_to_project(s["input_dir"]),
-                 _print("\n[green]\u2713 Default config applied.[/green]\n"
-                        if HAS_RICH else "\n  Default config applied.\n"),
-                 _pause()
-             )),
+            ("Edit info",       "title, author, version, classification",      action_edit_info),
+            ("Edit properties", "{{placeholder}} values",                      action_edit_properties),
+            ("Edit config",     "browse and edit every config.yaml setting",   action_edit_config),
+            (None, None, None),
+            ("Copy config",     "copy a saved config into this project",
+             lambda s: _copy_named_config_to_project(s)),
+            ("Save as config",  "save this project's config as a reusable named config",
+             lambda s: _save_project_as_config(s)),
+            ("Save as template","save this project as a reusable template",
+             lambda s: _save_project_as_template(s)),
         ]),
     ]
 
@@ -3294,10 +4132,21 @@ def _action_more(state: dict) -> None:
         for cat_name, actions in CATEGORIES:
             flat.append((f"── {cat_name} ──", "", None))
             for label, note, fn in actions:
-                flat.append((label, note, fn))
+                if label is None:
+                    flat.append((None, None, None))  # visual spacer
+                else:
+                    flat.append((label, note, fn))
 
         # Only pass real items (non-headers) to _menu
-        menu_items = [(l, n) if fn else None for l, n, fn in flat]
+        # None entries become spacers (non-selectable)
+        menu_items = []
+        for l, n, fn in flat:
+            if l is None:
+                menu_items.append(None)  # spacer
+            elif fn is None:
+                menu_items.append(None)  # header/spacer
+            else:
+                menu_items.append((l, n))
 
         result = _menu(menu_items, title="More options", extras=[("b", "Back")])
         if not isinstance(result, int) or result >= len(flat):
@@ -3355,11 +4204,18 @@ def _silent_build(state: dict, out_path: Path = None) -> None:
     builder.save(out)
 
 
-def _run_project(proj_dir: Path):
+def _run_project(proj_dir: Path, is_template: bool = False):
     """Running view: open VS Code + live preview, then W/V/P/M/B keys."""
     import threading, time as _time
 
     _save_last(proj_dir.name)
+    # Templates render with the default named config
+    if is_template:
+        _dflt = _get_default_config_name()
+        _nc = CONFIGS_DIR / f"{_dflt}.yaml" if _dflt else None
+        if _nc and _nc.exists():
+            import shutil as _sh_t
+            _sh_t.copy2(str(_nc), str(proj_dir / "input" / "config.yaml"))
     state      = _project_state(proj_dir)
     output_dir = state["output_dir"]
     input_dir  = state["input_dir"]
@@ -3536,6 +4392,9 @@ loadPages().then(async () => {
             _build_p_running[0] = True
             try:
                 fresh = _project_state(proj_dir)
+                # Build the real document.docx first so W key always has latest
+                _silent_build(fresh)
+                # Then build preview.docx for PDF conversion
                 _silent_build(fresh, out_path=preview_docx)
 
                 import io as _io, sys as _sys
@@ -3549,28 +4408,44 @@ loadPages().then(async () => {
                         pass
                 _pdf_ok = False
                 try:
-                    import win32com.client as _wc
-                    _word = _wc.DispatchEx("Word.Application")
+                    import win32com.client as _wc, time as _t
+                    # Use Dispatch (not DispatchEx) to reuse existing Word instance
+                    # DispatchEx creates a new instance that conflicts with open docs
+                    _word = _wc.Dispatch("Word.Application")
                     _word.Visible = False
                     _word.DisplayAlerts = False
+                    _doc = None
                     try:
-                        _doc = _word.Documents.Open(
-                            str(preview_docx),
-                            ConfirmConversions=False,
-                            ReadOnly=True,
-                            AddToRecentFiles=False,
-                            NoEncodingDialog=True,
-                        )
+                        # Retry open — Word may briefly reject calls while busy
+                        for _att in range(3):
+                            try:
+                                _doc = _word.Documents.Open(
+                                    str(preview_docx),
+                                    ConfirmConversions=False,
+                                    ReadOnly=True,
+                                    AddToRecentFiles=False,
+                                    NoEncodingDialog=True,
+                                )
+                                break
+                            except Exception:
+                                if _att < 2: _t.sleep(1.0)
+                                else: raise
                         _doc.ExportAsFixedFormat(
                             str(preview_pdf),
                             17,    # wdExportFormatPDF
                             False, # OpenAfterExport
                             0,     # OptimizeFor: print
                         )
-                        _doc.Close(SaveChanges=False)
                         _pdf_ok = True
                     finally:
-                        _word.Quit()
+                        if _doc is not None:
+                            for _att in range(3):
+                                try:
+                                    _doc.Close(SaveChanges=False)
+                                    break
+                                except Exception:
+                                    if _att < 2: _t.sleep(0.5)
+                        # Do NOT quit Word — user may have it open
                 except Exception:
                     # Fallback to docx2pdf if direct COM fails
                     from docx2pdf import convert as _docx2pdf
@@ -3644,6 +4519,13 @@ loadPages().then(async () => {
 
                 (render_dir / "preview_pages.txt").write_text(str(n), encoding="utf-8")
                 ver_file.write_text(str(time.time()), encoding="utf-8")
+
+                # Build document.docx after preview is fully ready so the user
+                # sees the preview update first, then Word catches up silently.
+                try:
+                    _silent_build(_project_state(proj_dir))
+                except Exception:
+                    pass  # Don't let a build error crash the preview loop
                 return True
             except Exception as _e:
                 import traceback
@@ -3757,10 +4639,11 @@ loadPages().then(async () => {
         if raw == "w":
             built = state["built_docx"]
             if built.exists():
-                # If preview is running, open a copy so Word doesn't conflict
-                # with docx2pdf which may have preview.docx open via COM
-                import shutil as _sh, tempfile as _tf
-                _tmp = Path(_tf.gettempdir()) / f"evdeo_{built.name}"
+                # Open a uniquely-named temp copy each time so Word always
+                # gets the latest version and doesn't reuse a stale cached file
+                import shutil as _sh, tempfile as _tf, time as _tw
+                _stamp = int(_tw.time() * 1000) % 100000
+                _tmp = Path(_tf.gettempdir()) / f"evdeo_{_stamp}_{built.name}"
                 try:
                     _sh.copy2(str(built), str(_tmp))
                     _open_path(_tmp)
@@ -3838,9 +4721,11 @@ def main():
         if choice is None:  continue
         if choice == "q":   break
         if choice == "a":   action_new_project(); continue
-        if choice == "s":   action_archive_project(); continue
+        if choice == "s":   action_new_project_from_word(); continue
+        if choice == "d":   action_archive_project(); continue
         if choice == "f":   action_unarchive_project(); continue
-        if choice == "d":   action_change_defaults(projects); continue
+        if choice == "t":   action_templates(); continue
+        if choice == "c":   action_configs(); continue
 
         proj_dir = PROJECTS_DIR / choice
         if proj_dir.exists():

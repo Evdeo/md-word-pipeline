@@ -309,44 +309,44 @@ def is_image_table(rows: List[List[str]]) -> bool:
 def apply_col_widths(table: Table, widths_str: str, total_dxa: int = 0):
     """Apply custom column widths from '20%,50%,30%' string.
 
-    total_dxa: content width in twips. If 0, computed from the table's
-    existing tblGrid so the percentages are applied against the actual width.
+    Uses pct-based widths so Word calculates the actual pixel size at render
+    time from its own page/margin settings — same as regular tables. This
+    guarantees custom-width tables align precisely with all other tables.
+
+    Each % is of the full text area. Columns summing to less than 100%
+    produce a proportionally narrower table.
     """
     parts = [p.strip().rstrip("%") for p in widths_str.split(",")]
     try:
         pcts = [float(p) for p in parts]
     except ValueError:
         return
-    total_pct = sum(pcts) or 100
+
+    total_pct   = sum(pcts)          # e.g. 100.0 for full-width, 70.0 for narrower
+    # OOXML pct unit: 1/50th of a percent, so 100% = 5000
+    col_pct     = [int(p * 50) for p in pcts]   # each column in pct units
+    table_pct   = int(total_pct * 50)            # table total in pct units
 
     tbl = table._tbl
 
-    # Determine total width from existing tblGrid if not provided
-    if not total_dxa:
-        tblGrid = tbl.find(qn("w:tblGrid"))
-        if tblGrid is not None:
-            grid_cols = tblGrid.findall(qn("w:gridCol"))
-            total_dxa = sum(int(c.get(qn("w:w"), 0)) for c in grid_cols)
-        if not total_dxa:
-            total_dxa = 9360   # fallback: ~6.5in A4 content width
-
-    dxa_widths = [int(total_dxa * p / total_pct) for p in pcts]
-
-    # 1. Update tblW to fixed width
+    # 1. Set tblW to pct — Word resolves this against the real text area
     tblPr = tbl.find(qn("w:tblPr"))
     if tblPr is None:
         tblPr = OxmlElement("w:tblPr")
         tbl.insert(0, tblPr)
 
     tblW = OxmlElement("w:tblW")
-    tblW.set(qn("w:w"),    str(total_dxa))
-    tblW.set(qn("w:type"), "dxa")
+    tblW.set(qn("w:w"),    str(table_pct))
+    tblW.set(qn("w:type"), "pct")
     existing = tblPr.find(qn("w:tblW"))
     if existing is not None:
         tblPr.remove(existing)
     tblPr.append(tblW)
 
-    # 2. Update tblGrid — Word uses this as the authoritative column layout
+    # 2. Update tblGrid with dxa for column proportions (use total_dxa for grid only)
+    if not total_dxa:
+        total_dxa = 9360
+    dxa_widths = [int(total_dxa * p / 100) for p in pcts]
     tblGrid = tbl.find(qn("w:tblGrid"))
     if tblGrid is not None:
         tbl.remove(tblGrid)
@@ -355,19 +355,18 @@ def apply_col_widths(table: Table, widths_str: str, total_dxa: int = 0):
         gc = OxmlElement("w:gridCol")
         gc.set(qn("w:w"), str(w))
         new_grid.append(gc)
-    # Insert tblGrid after tblPr
     tblPr_idx = list(tbl).index(tblPr) if tblPr in tbl else 0
     tbl.insert(tblPr_idx + 1, new_grid)
 
-    # 3. Update each cell's tcW
+    # 3. Set each cell's tcW as pct so it scales with the table
     for row in table.rows:
         for i, cell in enumerate(row.cells):
-            if i < len(dxa_widths):
+            if i < len(col_pct):
                 tc   = cell._tc
                 tcPr = tc.get_or_add_tcPr()
                 tcW  = OxmlElement("w:tcW")
-                tcW.set(qn("w:w"),    str(dxa_widths[i]))
-                tcW.set(qn("w:type"), "dxa")
+                tcW.set(qn("w:w"),    str(col_pct[i]))
+                tcW.set(qn("w:type"), "pct")
                 existing_w = tcPr.find(qn("w:tcW"))
                 if existing_w is not None:
                     tcPr.remove(existing_w)
@@ -557,8 +556,9 @@ def format_data_table(table: Table, col_widths: Optional[str] = None,
                     if child.tag not in _KEEP_TCPR:
                         tcPr.remove(child)
 
-    # ── Prevent rows from splitting across pages ─────────────────────────────
-    for tr in tbl.findall(qn("w:tr")):
+    # ── Prevent rows from splitting across pages + repeat header ─────────────
+    rows = tbl.findall(qn("w:tr"))
+    for row_idx, tr in enumerate(rows):
         trPr = tr.find(qn("w:trPr"))
         if trPr is None:
             trPr = OxmlElement("w:trPr")
@@ -567,6 +567,11 @@ def format_data_table(table: Table, col_widths: Optional[str] = None,
             cantSplit = OxmlElement("w:cantSplit")
             cantSplit.set(qn("w:val"), "1")
             trPr.append(cantSplit)
+        # Repeat header row on each new page
+        if row_idx == 0 and has_header:
+            if trPr.find(qn("w:tblHeader")) is None:
+                tblHeader = OxmlElement("w:tblHeader")
+                trPr.append(tblHeader)
 
     if col_widths:
         apply_col_widths(table, col_widths, total_dxa)

@@ -284,6 +284,43 @@ def _add_bookmark(para, bookmark_id: int, name: str):
 
 # ─── DocumentBuilder ──────────────────────────────────────────────────────────
 
+
+def _normalise_list_indent(md: str) -> str:
+    """Normalise list indentation to multiples of 4 spaces.
+
+    Detects the base indent unit used in the document (typically 2 or 4 spaces)
+    and scales all list item indents proportionally so CommonMark nesting works.
+    VS Code and many editors default to 2-space indents, but CommonMark requires
+    4 spaces to nest inside a list item.
+    """
+    import re
+    lines = md.split("\n")
+
+    # Find the smallest non-zero indent used on any list line
+    indents = set()
+    for line in lines:
+        m = re.match(r"^( +)([-*+]|\d+[.)]) ", line)
+        if m:
+            indents.add(len(m.group(1)))
+
+    if not indents:
+        return md  # no indented list items
+
+    base = min(indents)
+    if base >= 4:
+        return md  # already 4-space, no change needed
+
+    factor = 4 // base if base > 0 else 1
+    out = []
+    for line in lines:
+        m = re.match(r"^( +)([-*+]|\d+[.)]) ", line)
+        if m:
+            n    = len(m.group(1))
+            line = " " * (n * factor) + line[n:]
+        out.append(line)
+    return "\n".join(out)
+
+
 class DocumentBuilder:
 
     def __init__(self, config: Optional[Dict] = None, revisions: Optional[list] = None,
@@ -314,6 +351,7 @@ class DocumentBuilder:
         # e.g. {"#data-flow": ("Figure", 1), "#feature-status": ("Table", 1)}
         self._label_map: Dict[str, Tuple[str, int]] = {}
         self._last_table          = None                       # for col-widths post-processing
+        self._last_table_alignment = WD_ALIGN_PARAGRAPH.CENTER  # for caption alignment
         self._last_img_alignment  = WD_ALIGN_PARAGRAPH.CENTER  # for caption alignment
         self._heading_num_id      = 0     # 0 = disabled; set dynamically once set up
         self._ol_abs_id           = None  # abstractNumId for ordered list numbering
@@ -398,8 +436,51 @@ class DocumentBuilder:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    def _ensure_list_styles(self) -> None:
+        """Create List Bullet/Number styles for levels 4+ (Word only has 1-3 built-in).
+        Levels 4+ are created inheriting from level 3, with proportional indentation.
+        """
+        from docx.oxml import OxmlElement as _OE
+        from docx.oxml.ns import qn as _qn
+        styles = self.doc.styles
+        MAX_LEVEL = 8
+
+        for base in ("List Bullet", "List Number"):
+            for lvl in range(4, MAX_LEVEL + 1):
+                style_name = f"{base} {lvl}"
+                try:
+                    styles[style_name]
+                    continue  # already exists
+                except KeyError:
+                    pass
+                # Inherit from level 3 style
+                try:    parent_id = styles[f"{base} 3"].style_id
+                except: parent_id = styles[base].style_id
+
+                style_el = _OE("w:style")
+                style_el.set(_qn("w:type"), "paragraph")
+                style_el.set(_qn("w:styleId"), style_name.replace(" ", ""))
+                name_el = _OE("w:name"); name_el.set(_qn("w:val"), style_name)
+                style_el.append(name_el)
+                based_el = _OE("w:basedOn"); based_el.set(_qn("w:val"), parent_id)
+                style_el.append(based_el)
+                # Indent: 720 twips per level (0.5in), 360 hanging
+                pPr = _OE("w:pPr")
+                ind = _OE("w:ind")
+                ind.set(_qn("w:left"),    str(720 * lvl))
+                ind.set(_qn("w:hanging"), "360")
+                pPr.append(ind)
+                # Zero spacing
+                sp = _OE("w:spacing")
+                sp.set(_qn("w:before"), "0")
+                sp.set(_qn("w:after"),  "40")
+                pPr.append(sp)
+                style_el.append(pPr)
+                self.doc.styles.element.append(style_el)
+
     def setup(self):
         define_styles(self.doc, self.config.get("styles"))
+        self._ensure_list_styles()  # create List Bullet/Number 4+ styles
         sec = self.doc.sections[0]
         pc  = self.config["page"]
         sec.top_margin    = Inches(self._cm_to_in(pc.get("margin_top",    "2.54cm")))
@@ -825,7 +906,7 @@ class DocumentBuilder:
         """Parse and emit normal markdown blocks, with col-widths lookahead."""
         if not md_text.strip():
             return
-        ast    = self._parser.parse(md_text)
+        ast    = self._parser.parse(_normalise_list_indent(md_text))
         blocks = list(ast.children)
         i = 0
         while i < len(blocks):
@@ -840,9 +921,31 @@ class DocumentBuilder:
                     j += 1
                 if j < len(blocks) and blocks[j].__class__.__name__ == "Paragraph":
                     nxt_txt = self._plain_text(blocks[j]).strip()
-                    m = re.match(r'^\{col-widths="([^"]+)"\}$', nxt_txt)
-                    if m and self._last_table is not None:
-                        apply_col_widths(self._last_table, m.group(1))
+                    # Parse {col-widths="..."} and optional align="..."
+                    # Both can appear in same block: {col-widths="30%,70%" align="left"}
+                    col_m   = re.search(r'col-widths="([^"]+)"', nxt_txt)
+                    align_m = re.search(r'align="([^"]+)"', nxt_txt)
+                    if (col_m or align_m) and nxt_txt.startswith("{") and nxt_txt.endswith("}"):
+                        _cdxa = int(self._img.content_width_emu / 635)
+                        if col_m and self._last_table is not None:
+                            apply_col_widths(self._last_table, col_m.group(1), total_dxa=_cdxa)
+                        # Determine alignment — default CENTER for custom-width tables
+                        if align_m:
+                            _aval = align_m.group(1).lower()
+                            _alignment = {
+                                "left":   WD_ALIGN_PARAGRAPH.LEFT,
+                                "center": WD_ALIGN_PARAGRAPH.CENTER,
+                                "right":  WD_ALIGN_PARAGRAPH.RIGHT,
+                            }.get(_aval, WD_ALIGN_PARAGRAPH.CENTER)
+                        else:
+                            _alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        if self._last_table is not None:
+                            # Convert pct→dxa for any non-left alignment
+                            if _alignment != WD_ALIGN_PARAGRAPH.LEFT:
+                                self._fix_table_width_for_alignment(
+                                    self._last_table, _cdxa)
+                            self._apply_table_alignment(self._last_table, _alignment)
+                            self._last_table_alignment = _alignment
                         i = j + 1
                         continue
             i += 1
@@ -1662,7 +1765,7 @@ class DocumentBuilder:
         bm_name = f"tbl-{anchor}" if anchor else f"tbl-{tbl_num}"
 
         para = self.doc.add_paragraph(style="Caption")
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        para.alignment = getattr(self, "_last_table_alignment", WD_ALIGN_PARAGRAPH.LEFT)
 
         # Label ("Table N:") — bold + italic
         # Description — italic only
@@ -1703,40 +1806,100 @@ class DocumentBuilder:
 
     # ── list ──────────────────────────────────────────────────────────────────
 
+    def _fix_table_width_for_alignment(self, table, content_dxa: int) -> None:
+        """Convert a pct-based tblW to dxa so Word can center/right-align correctly.
+        
+        Word cannot center a table with pct width — it needs an absolute dxa
+        width so it knows how much margin to add on each side.
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn as _qn
+        tbl   = table._tbl
+        tblPr = tbl.find(_qn("w:tblPr"))
+        if tblPr is None:
+            return
+        tblW = tblPr.find(_qn("w:tblW"))
+        if tblW is None:
+            return
+        w_type = tblW.get(_qn("w:type"), "")
+        w_val  = tblW.get(_qn("w:w"), "5000")
+        if w_type == "pct":
+            # Convert pct units (50ths of %) to dxa
+            pct_val   = int(w_val)          # e.g. 2750 = 55%
+            dxa_width = int(content_dxa * pct_val / 5000)
+            tblW.set(_qn("w:w"),    str(dxa_width))
+            tblW.set(_qn("w:type"), "dxa")
+            # Also update tblGrid cols to match
+            tblGrid = tbl.find(_qn("w:tblGrid"))
+            if tblGrid is not None:
+                grid_cols = tblGrid.findall(_qn("w:gridCol"))
+                total_grid = sum(int(c.get(_qn("w:w"), 0)) for c in grid_cols)
+                if total_grid > 0:
+                    for c in grid_cols:
+                        old_w = int(c.get(_qn("w:w"), 0))
+                        c.set(_qn("w:w"), str(int(old_w * dxa_width / total_grid)))
+            # Update cell widths too
+            for tr in tbl.findall(_qn("w:tr")):
+                for tc in tr.findall(_qn("w:tc")):
+                    tcPr = tc.find(_qn("w:tcPr"))
+                    if tcPr is not None:
+                        tcW = tcPr.find(_qn("w:tcW"))
+                        if tcW is not None:
+                            tc_type = tcW.get(_qn("w:type"), "")
+                            tc_val  = int(tcW.get(_qn("w:w"), 0))
+                            if tc_type == "pct" and tc_val > 0:
+                                tcW.set(_qn("w:w"),    str(int(content_dxa * tc_val / 5000)))
+                                tcW.set(_qn("w:type"), "dxa")
+
+    def _apply_table_alignment(self, table, alignment) -> None:
+        """Set horizontal alignment on a table using python-docx's own API."""
+        from docx.enum.table import WD_TABLE_ALIGNMENT
+        jc_map = {
+            WD_ALIGN_PARAGRAPH.LEFT:   WD_TABLE_ALIGNMENT.LEFT,
+            WD_ALIGN_PARAGRAPH.CENTER: WD_TABLE_ALIGNMENT.CENTER,
+            WD_ALIGN_PARAGRAPH.RIGHT:  WD_TABLE_ALIGNMENT.RIGHT,
+        }
+        table.alignment = jc_map.get(alignment, WD_TABLE_ALIGNMENT.LEFT)
+        # Remove tblInd for non-left — it overrides the centering offset
+        if alignment != WD_ALIGN_PARAGRAPH.LEFT:
+            from docx.oxml.ns import qn
+            tblPr = table._tbl.find(qn("w:tblPr"))
+            if tblPr is not None:
+                for ind in tblPr.findall(qn("w:tblInd")):
+                    tblPr.remove(ind)
+
     def _emit_list(self, node, src: Path, level: int = 0,
-                   forced_num_id: Optional[int] = None):
+                   forced_num_id: Optional[int] = None,
+                   parent_ordered: Optional[bool] = None):
         """Emit a list node.
 
-        For ordered and unordered lists, a fresh numId is allocated at the top
-        level (level==0) and passed down to all nested levels so they share the
-        same abstractNum but the counter is independent from any other list or
-        from headings.  Explicit paragraph-level numPr is always written so it
-        can never be accidentally inherited from a style that conflicts with
-        heading numbering.
+        forced_num_id is the parent list's numId, passed down so same-type
+        nested lists share the same abstractNum. When the type changes
+        (e.g. unordered nested inside ordered), a fresh numId is allocated
+        so bullet lists always render as bullets even inside numbered lists.
         """
         ordered = getattr(node, "ordered", False)
 
         # Determine the numId for list items at this nesting depth.
+        type_changed = (parent_ordered is not None and ordered != parent_ordered)
+
         if ordered:
-            if forced_num_id is not None:
-                # nested level — reuse parent's numId (same counter family)
+            if forced_num_id is not None and not type_changed:
+                # same-type nested level — reuse parent numId
                 list_num_id = forced_num_id
             elif self._ol_abs_id is not None:
-                # top-level ordered list — allocate a brand-new numId so this
-                # list starts at 1 and shares nothing with any heading counter
                 list_num_id = self._new_ol_num_id()
             else:
-                list_num_id = None  # numbering disabled globally
+                list_num_id = None
         else:
             # unordered (bullet) list
-            if forced_num_id is not None:
-                # nested level — reuse parent's numId (same bullet family)
+            if forced_num_id is not None and not type_changed:
+                # same-type nested level — reuse parent numId
                 list_num_id = forced_num_id
             elif self._ul_abs_id is not None:
-                # top-level unordered list — allocate a brand-new numId
                 list_num_id = self._new_ul_num_id()
             else:
-                list_num_id = None  # numbering disabled globally
+                list_num_id = None
 
         for item in node.children:
             inline_nodes = []
@@ -1749,7 +1912,11 @@ class DocumentBuilder:
                 else:
                     inline_nodes.append(child)
 
-            style = ("List Number" if ordered else "List Bullet") + (f" {level+1}" if level > 0 else "")
+            # Cap style at level 3 — List Bullet 4/5 have built-in spacing
+            # quirks in Word's template. We use List Bullet 3 style for all
+            # deeper levels and rely on ilvl + our explicit spacing instead.
+            _style_level = min(level, 2)
+            style = ("List Number" if ordered else "List Bullet") + (f" {_style_level+1}" if _style_level > 0 else "")
             try:
                 para = self.doc.add_paragraph(style=style)
             except Exception:
@@ -1758,6 +1925,20 @@ class DocumentBuilder:
             para.clear()
             for child in inline_nodes:
                 self._fill_inline(para, child, src)
+
+            # Force spacing via raw XML to override style-level spacing on
+            # List Bullet 4/5 which have explicit space_after in the style def
+            from docx.oxml import OxmlElement
+            _pPr = para._p.get_or_add_pPr()
+            _existing_sp = _pPr.find(qn('w:spacing'))
+            if _existing_sp is not None:
+                _pPr.remove(_existing_sp)
+            _sp = OxmlElement('w:spacing')
+            _sp.set(qn('w:before'), '0')
+            _sp.set(qn('w:after'),  '28')   # 2pt in twips (1/20 pt) — matches Pt(2) in EMU context
+            _sp.set(qn('w:line'),   '240')  # single line spacing
+            _sp.set(qn('w:lineRule'), 'auto')
+            _pPr.append(_sp)
 
             # Attach explicit numPr for both ordered and unordered lists.
             # This ensures the paragraph uses our dedicated abstractNum counter
@@ -1770,6 +1951,7 @@ class DocumentBuilder:
                 self._emit_list(
                     nested_list, src, level + 1,
                     forced_num_id=list_num_id,
+                    parent_ordered=ordered,
                 )
 
     # ── blockquote ────────────────────────────────────────────────────────────
@@ -1890,11 +2072,7 @@ class DocumentBuilder:
                         # Add line break between paragraphs within the same cell
                         cell_para.add_run().add_break()
             
-            # Add spacing after alert table for visual separation between consecutive alerts
-            # 0pt gap - no extra spacing, relies on grey backgrounds for separation
-            spacer = self.doc.add_paragraph()
-            spacer.paragraph_format.space_before = Pt(0)
-            spacer.paragraph_format.space_after  = Pt(8)
+            # No spacer between alerts — the coloured borders provide separation
         else:
             # Regular blockquote: Use paragraph style
             children = node.children if hasattr(node, 'children') and isinstance(node.children, list) else []
@@ -1974,6 +2152,7 @@ class DocumentBuilder:
                               table_cfg=self.config.get("styles"))
 
         self._last_table = table
+        self._last_table_alignment = WD_ALIGN_PARAGRAPH.CENTER  # default: centered caption for full-width tables
 
     # ── image group (:::figures) ──────────────────────────────────────────────
 

@@ -194,6 +194,7 @@ def define_styles(doc: Document, style_cfg: Optional[dict] = None) -> None:
     cap.font.bold       = _cfg_bool(capc,  "bold",           True)
     cap.font.size       = Pt(_cfg_float(capc, "font_size_pt", 9))
     cap.font.color.rgb  = _cfg_color(capc, "color",          RGBColor(0x55, 0x55, 0x55))
-    cap.paragraph_format.alignment    = WD_ALIGN_PARAGRAPH.CENTER
+    # Alignment is set per-paragraph in _emit_fig_caption/_emit_tbl_caption
+    # so we do not set it here — that way captions follow their figure's alignment.
     cap.paragraph_format.space_before = Pt(_cfg_float(capc, "space_before_pt", 2))
     cap.paragraph_format.space_after  = Pt(_cfg_float(capc, "space_after_pt",  8))
