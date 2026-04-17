@@ -2247,15 +2247,12 @@ class DocumentBuilder:
             img_para = cell.paragraphs[0]
             img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-            result = self._img.load(path_str, src.parent if src.is_file() else src)
-            if result:
-                fp, w_px, h_px = result
-                w_emu, h_emu   = self._img.calc_emu(w_px, h_px, size_class, width_attr)
-                # Cap to column width so images never overflow
-                if w_emu > col_width_emu:
-                    aspect = h_px / w_px if w_px else 1.0
-                    w_emu  = col_width_emu
-                    h_emu  = int(w_emu * aspect)
+            resolved = self._resolve_image_for_embed(
+                path_str, src, size_class, width_attr,
+                max_width_emu=col_width_emu,
+            )
+            if resolved:
+                fp, w_emu, _ = resolved
                 run = img_para.add_run()
                 try:
                     run.add_picture(str(fp), width=Inches(self._img.inches(w_emu)))
@@ -2263,7 +2260,6 @@ class DocumentBuilder:
                     log.warning("could not embed image %s: %s", path_str, e)
                     img_para.add_run(f"[{path_str}]")
             else:
-                log.warning("image not found: %s", path_str)
                 img_para.add_run(f"[Image not found: {path_str}]")
 
             # Sub-caption:  a) Description text
@@ -2332,6 +2328,31 @@ class DocumentBuilder:
 
         # ── image paragraph ───────────────────────────────────────────────────────
 
+    def _resolve_image_for_embed(
+        self, path_str: str, src: Path,
+        size_class: Optional[str], width_attr: Optional[str],
+        max_width_emu: Optional[int] = None,
+    ) -> Optional[Tuple[Path, int, int]]:
+        """Resolve an image reference and compute its embed dimensions.
+
+        Returns (absolute_path, width_emu, height_emu) or None (with a
+        warning logged) if the image can't be found. Factored out to kill
+        duplication across `_emit_image_group`, `_emit_image_para`, and
+        inline-image handling in `_fill_inline`.
+        """
+        base_dir = src.parent if src.is_file() else src
+        result = self._img.load(path_str, base_dir)
+        if not result:
+            log.warning("image not found: %s", path_str)
+            return None
+        fp, w_px, h_px = result
+        w_emu, h_emu = self._img.calc_emu(w_px, h_px, size_class, width_attr)
+        if max_width_emu and w_emu > max_width_emu:
+            aspect = h_px / w_px if w_px else 1.0
+            w_emu = max_width_emu
+            h_emu = int(w_emu * aspect)
+        return fp, w_emu, h_emu
+
     def _emit_image_para(self, img_node, src: Path, extra_attrs: str = ""):
         """Emit a paragraph containing one image, with optional alignment and size."""
         path_str  = img_node.dest if hasattr(img_node, "dest") else ""
@@ -2359,12 +2380,11 @@ class DocumentBuilder:
         elif re.search(r"\{[^}]*\.center[^}]*\}", combined):
             alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        result = self._img.load(path_str, src.parent if src.is_file() else src)
-        if not result:
+        resolved = self._resolve_image_for_embed(path_str, src, size_class, width_attr)
+        if not resolved:
             self.doc.add_paragraph(f"[Image not found: {path_str}]")
             return
-        full_path, w_px, h_px = result
-        w_emu, h_emu = self._img.calc_emu(w_px, h_px, size_class, width_attr)
+        full_path, w_emu, h_emu = resolved
 
         self._last_img_alignment = alignment  # captions inherit this
 
@@ -2489,10 +2509,11 @@ class DocumentBuilder:
                         m_w = re.search(r"\{width=([^}]+)\}", raw_nxt)
                         if m_w:
                             width_attr = f"width={m_w.group(1)}"
-                result = self._img.load(path_str, src.parent if src.is_file() else src)
-                if result:
-                    fp, w_px, h_px = result
-                    w_emu, h_emu   = self._img.calc_emu(w_px, h_px, size_class, width_attr)
+                resolved = self._resolve_image_for_embed(
+                    path_str, src, size_class, width_attr
+                )
+                if resolved:
+                    fp, w_emu, _ = resolved
                     try:
                         run = para.add_run()
                         run.add_picture(str(fp), width=Inches(self._img.inches(w_emu)))
@@ -2500,7 +2521,6 @@ class DocumentBuilder:
                         log.warning("could not embed image %s: %s", path_str, e)
                         para.add_run(f"[{path_str}]")
                 else:
-                    log.warning("image not found: %s", path_str)
                     para.add_run(f"[Image: {path_str}]")
 
             elif ct in ("LineBreak", "HardBreak"):
