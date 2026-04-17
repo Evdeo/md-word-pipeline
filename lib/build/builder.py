@@ -33,6 +33,7 @@ from .styles import define_styles
 from .images import ImageProcessor, build_size_classes
 from .tables import (format_data_table, format_image_table, is_image_table,
                      apply_col_widths, build_merge_plan, apply_merges, parse_cell_attrs)
+from .overlays import parse_overlay_block, wrap_picture_in_group
 from ..log import get_logger
 
 import marko
@@ -884,18 +885,21 @@ class DocumentBuilder:
             self._process_blocks_with_figures(md_text, source_dir)
     
     def _process_blocks_with_figures(self, md_text: str, source_dir: Path):
-        """Process markdown blocks, handling :::figures and :::space blocks separately."""
-        # Split out :::figures … ::: blocks and :::space{…} blocks before handing text to marko
-        # The \n before :::figures ensures we only match blocks at line start,
-        # not backtick-quoted instances like `:::figures` in inline text
-        # :::space{lines=N} or :::space{pt=N} are self-closing (no ending :::)
+        """Process markdown blocks, handling :::figures / :::overlay / :::space
+        blocks separately before handing normal content to marko."""
+        # The \n before each ::: keyword ensures we only match blocks at line
+        # start, not backtick-quoted instances like `:::figures` in inline text.
+        # :::space{lines=N} or :::space{pt=N} are self-closing (no ending :::).
         parts = re.split(
             r'(\n:::figures\b[^\n]*\n[\s\S]*?\n:::\n'
+            r'|\n:::overlay\b[^\n]*\n[\s\S]*?\n:::\n'
             r'|\n:::space\{[^}]*\}\n?)',
             md_text)
         for part in parts:
             if part.startswith("\n:::figures") or part.startswith(":::figures"):
                 self._emit_image_group(part.strip(), source_dir)
+            elif part.startswith("\n:::overlay") or part.startswith(":::overlay"):
+                self._emit_overlay_block(part.strip(), source_dir)
             elif part.startswith("\n:::space") or part.startswith(":::space"):
                 m_lines = re.search(r'lines\s*=\s*(\d+)', part)
                 m_pt    = re.search(r'pt\s*=\s*([\d.]+)', part)
@@ -2327,6 +2331,64 @@ class DocumentBuilder:
                     r.bold = bold; r.italic = italic
 
         # ── image paragraph ───────────────────────────────────────────────────────
+
+    def _emit_overlay_block(self, block_text: str, src: Path) -> None:
+        """Render a :::overlay block as a grouped Word drawing.
+
+        The base image is embedded via ``run.add_picture`` so its rId is
+        registered in the docx package; then the generated ``<w:drawing>``
+        is rewritten so the picture becomes one child of a ``<wpg:wgp>``
+        group alongside native Word shapes for each declared arrow / rect /
+        ellipse / callout. Shapes remain editable in Word.
+        """
+        spec = parse_overlay_block(block_text)
+        if not spec.base_src:
+            log.warning("overlay block has no base image — skipping")
+            return
+
+        # Determine size class / width from attrs (mirrors ![](…){.medium} syntax)
+        size_class = None
+        width_attr = None
+        for cls in spec.attrs.get("classes", []) or []:
+            if cls in self._img.size_classes:
+                size_class = cls
+                break
+        if spec.attrs.get("width"):
+            w_val = spec.attrs["width"]
+            if w_val in self._img.size_classes:
+                size_class = w_val
+            else:
+                width_attr = f"width={w_val}"
+
+        resolved = self._resolve_image_for_embed(
+            spec.base_src, src, size_class, width_attr,
+        )
+        if not resolved:
+            self.doc.add_paragraph(f"[Image not found: {spec.base_src}]")
+            return
+        full_path, w_emu, h_emu = resolved
+
+        para = self.doc.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        para.paragraph_format.keep_with_next = True
+        run = para.add_run()
+        try:
+            run.add_picture(str(full_path), width=Inches(self._img.inches(w_emu)))
+        except (FileNotFoundError, OSError) as e:
+            log.warning("could not embed overlay base image %s: %s", spec.base_src, e)
+            para.add_run(f"[Could not load: {spec.base_src}]")
+            return
+
+        # Now rewrite the just-emitted drawing to wrap its pic:pic inside a
+        # wpg:wgp group that also holds the declared shapes.
+        drawings = run._r.findall(f".//{qn('w:drawing')}")
+        if drawings and spec.shapes:
+            wrap_picture_in_group(drawings[-1], spec.shapes, w_emu=w_emu, h_emu=h_emu)
+
+        # Attach anchor bookmark so {#id} can be cross-referenced.
+        bm_id = spec.attrs.get("id")
+        if bm_id:
+            self._bm_map[f"#{bm_id}"] = f"ov-{bm_id}"
 
     def _resolve_image_for_embed(
         self, path_str: str, src: Path,

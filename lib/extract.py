@@ -534,6 +534,14 @@ def _extract_images_from_element(element, doc, images_dir: Path,
 
     hint_name: optional suggested filename stem (e.g. from following caption text).
     """
+    from lib.build.overlays import (
+        NS_A as _NS_A,
+        NS_WPG as _NS_WPG,
+        extract_overlay_from_group,
+        overlay_to_markdown,
+        OverlaySpec,
+    )
+
     results = []
     for drawing in element.findall(f'.//{qn("w:drawing")}'):
         blip = drawing.find(f'.//{qn("a:blip")}')
@@ -543,6 +551,13 @@ def _extract_images_from_element(element, doc, images_dir: Path,
         r_embed = blip.get(f'{{{r_ns}}}embed')
         if not r_embed:
             continue
+
+        # Detect overlay group drawing — graphicData uri == NS_WPG means the
+        # drawing is a wpg:wgp group produced by our overlay emitter. The
+        # picture inside is the base image; siblings are shapes.
+        graphic_data = drawing.find(f'.//{{{_NS_A}}}graphicData')
+        is_overlay = (graphic_data is not None and
+                      graphic_data.get("uri") == _NS_WPG)
 
         # Alt text from docPr (descr or title)
         alt = ""
@@ -602,10 +617,27 @@ def _extract_images_from_element(element, doc, images_dir: Path,
         except Exception:
             pass
 
-        md = f"![{alt_text}](images/{img_name}){{.{size_cls}{align_cls}}}"
+        if is_overlay:
+            # Emit a :::overlay block instead of a plain image
+            shapes = extract_overlay_from_group(drawing, width_emu or 1, _height_emu(drawing) or 1)
+            spec = OverlaySpec(
+                base_src=f"images/{img_name}",
+                base_alt=alt_text,
+                attrs={"classes": [size_cls]},
+                shapes=shapes,
+            )
+            md = overlay_to_markdown(spec)
+        else:
+            md = f"![{alt_text}](images/{img_name}){{.{size_cls}{align_cls}}}"
         results.append((md, alt_text, size_cls))
 
     return results
+
+
+def _height_emu(drawing) -> int:
+    """Read cy from <wp:extent>, falling back to 0."""
+    extent = drawing.find(f'.//{qn("wp:extent")}')
+    return int(extent.get("cy", 0)) if extent is not None else 0
 
 
 # ── Paragraph style detection ─────────────────────────────────────────────────

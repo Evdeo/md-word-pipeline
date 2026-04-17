@@ -127,6 +127,40 @@ Side by side:
 *Figure 1: Caption. {#fig-1}*
 ```
 
+### Image overlays (arrows, callouts, annotations)
+
+For user-guide screenshots where you want arrows, boxes, and text
+callouts on top of a base image — all kept consistent across builds and
+editable in Word afterwards:
+
+```markdown
+:::overlay {#fig-login width=medium}
+![Login screen](screens/login.png)
+::arrow    from=20%,30% to=50%,35% color=#FF0000 stroke=2
+::rect     at=10%,20% size=30%,10% color=#FF0000 stroke=2
+::ellipse  at=55%,45% size=12%,12% color=#FF0000 stroke=2
+::callout  at=60%,40% size=22%,10% text="Click here" color=#0000FF fill=#FFFF99
+:::
+```
+
+Coordinates are percent-of-image, so shapes scale with the image if you
+resize the base. Available shapes:
+
+| Kind       | Required attrs                      | Optional attrs                    |
+|------------|-------------------------------------|-----------------------------------|
+| `arrow`    | `from=X%,Y% to=X%,Y%`               | `color` `stroke`                  |
+| `rect`     | `at=X%,Y% size=W%,H%`               | `color` `stroke` `fill`           |
+| `ellipse`  | `at=X%,Y% size=W%,H%`               | `color` `stroke` `fill`           |
+| `callout`  | `at=X%,Y% size=W%,H%`               | `color` `stroke` `fill` `text`    |
+
+The base image is embedded via python-docx and then wrapped in a native
+Word `wpg:wgp` group drawing alongside `wps:wsp` shapes — reviewers can
+drag an arrow in Word, the review importer will pick up the new
+position on the next round-trip.
+
+Requires Word 2010 or later. Very old Word versions won't render the
+group and will show only the base image.
+
 ### Cross-references
 
 ```markdown
@@ -165,6 +199,10 @@ project:
 {{project.name}} version {{project.version}}
 ```
 
+Unknown placeholders are left literal and a warning is logged so typos
+like `{{projec.name}}` don't silently produce empty text. To put a
+literal `{{` into the output, escape it with a backslash: `\{{literal}}`.
+
 ### Appendix
 
 ```markdown
@@ -193,6 +231,22 @@ Headings become A, A.1, A.2, B, B.1 etc.
 ## Defaults
 
 The main menu has a **Change defaults** option for the config applied to every new project. Edit the YAML directly, copy settings from a project, or go field by field and pick what to keep.
+
+---
+
+## Running the tests
+
+```bash
+pip install -r lib/requirements.txt
+pytest tests/ -v
+```
+
+Covers: bullet/ordered/nested lists, table merge markers (`<<` / `^^`)
+and column widths, heading numbering and appendix mode, image size
+classes, property substitution, section diff (identical / changed /
+moved / added / removed), overlay parser and XML emission, overlay
+round-trip through docx, and an end-to-end deterministic build of the
+showcase project.
 
 ---
 
