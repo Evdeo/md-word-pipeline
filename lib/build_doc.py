@@ -23,6 +23,7 @@ from typing import Optional
 import yaml
 
 from lib.build.builder import DocumentBuilder
+from lib.build.config_schema import validate_config
 from lib.log import configure as _configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -49,7 +50,8 @@ def load_config(path: Path) -> dict:
     if path and path.exists():
         try:
             with open(path, encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
+                raw = yaml.safe_load(f) or {}
+            return validate_config(raw)
         except Exception as e:
             log.warning("could not parse config.yaml (%s) — using defaults.", e)
             return {}
