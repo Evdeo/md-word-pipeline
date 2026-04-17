@@ -7,3 +7,7 @@ watchdog>=3.0.0
 pymupdf>=1.24.0
 docx2pdf>=0.1.8
 pywin32>=308
+pydantic>=2.0
+
+# Dev / test
+pytest>=8.0
