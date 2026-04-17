@@ -57,7 +57,10 @@ def configure(verbose: bool = False, quiet: bool = False,
     handler = _make_handler()
     handler.setLevel(level)
     root.addHandler(handler)
-    root.propagate = False
+    # Propagate to root so pytest's caplog fixture and any user-configured
+    # root logger can observe our records. Duplicate output is avoided because
+    # root logging handlers default to WARNING only when unconfigured.
+    root.propagate = True
     _configured = True
 
 

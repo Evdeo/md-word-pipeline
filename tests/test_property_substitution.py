@@ -35,12 +35,10 @@ def test_empty_properties_returns_input_unchanged():
 
 def test_undefined_key_preserved_and_warns(caplog):
     """Undefined placeholders stay literal and emit a warning."""
-    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.WARNING, logger="md_word_pipeline.build_doc")
     result = substitute_properties("Hi {{missing}}", {"present": "yes"})
     assert "{{missing}}" in result
-    # After Phase B3, a warning should be emitted naming the key.
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("missing" in r.getMessage() for r in warnings), \
+    assert any("missing" in r.getMessage() for r in caplog.records), \
         "expected a warning naming the undefined key"
 
 

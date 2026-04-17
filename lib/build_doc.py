@@ -111,16 +111,40 @@ def load_all_yaml_files(src_dir: Path, exclude_files: Optional[set] = None) -> d
     return all_properties
 
 
+_PLACEHOLDER_RE = re.compile(r'(?<!\\)\{\{(\s*[\w.]+\s*)\}\}')
+_ESCAPED_RE = re.compile(r'\\(\{\{[^}]*\}\})')
+
+
 def substitute_properties(text: str, properties: dict) -> str:
-    """Replace {{property.name}} placeholders with actual values."""
-    if not properties:
+    r"""Replace ``{{property.name}}`` placeholders with their values.
+
+    Behavior:
+    - Unknown keys are left literal and a warning is logged naming the key.
+    - ``\{{literal}}`` is an escape — the backslash is stripped, the braces
+      survive. Nothing inside is substituted.
+    - Braces that don't match the placeholder grammar (e.g. ``{"x": 1}``) are
+      untouched.
+    """
+    if not text:
         return text
 
-    def replace_match(match):
-        key = match.group(1).strip()
-        return properties.get(key, match.group(0))
+    unknown: set = set()
 
-    return re.sub(r'\{\{(\s*[\w.]+\s*)\}\}', replace_match, text)
+    def _replace(m: "re.Match") -> str:
+        key = m.group(1).strip()
+        if not properties or key not in properties:
+            unknown.add(key)
+            return m.group(0)
+        return properties[key]
+
+    result = _PLACEHOLDER_RE.sub(_replace, text)
+    # Strip the single-backslash escape on \{{...}} so the braces render literally.
+    result = _ESCAPED_RE.sub(r'\1', result)
+
+    for key in sorted(unknown):
+        log.warning("undefined property {{%s}} — left as literal", key)
+
+    return result
 
 
 
