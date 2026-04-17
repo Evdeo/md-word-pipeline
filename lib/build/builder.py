@@ -33,8 +33,11 @@ from .styles import define_styles
 from .images import ImageProcessor, build_size_classes
 from .tables import (format_data_table, format_image_table, is_image_table,
                      apply_col_widths, build_merge_plan, apply_merges, parse_cell_attrs)
+from ..log import get_logger
 
 import marko
+
+log = get_logger(__name__)
 
 
 # ─── heading numbering XML helpers ────────────────────────────────────────────
@@ -454,8 +457,10 @@ class DocumentBuilder:
                 except KeyError:
                     pass
                 # Inherit from level 3 style
-                try:    parent_id = styles[f"{base} 3"].style_id
-                except: parent_id = styles[base].style_id
+                try:
+                    parent_id = styles[f"{base} 3"].style_id
+                except KeyError:
+                    parent_id = styles[base].style_id
 
                 style_el = _OE("w:style")
                 style_el.set(_qn("w:type"), "paragraph")
@@ -870,8 +875,7 @@ class DocumentBuilder:
             
             # Enable appendix mode
             self._appendix_mode = True
-            if getattr(self, '_verbose', True):
-                print("Entering appendix mode - headings will use Appendix A, A1, etc. numbering")
+            log.debug("Entering appendix mode — headings switch to Appendix A, A.1, …")
             
             # Process post-appendix content with appendix numbering
             self._process_blocks_with_figures(post_appendix, source_dir)
@@ -1018,10 +1022,10 @@ class DocumentBuilder:
                             new_body = _et.fromstring(xml_str)
                             body.getparent().replace(body, new_body)
                             body = self.doc.element.body
-                    except Exception:
-                        pass  # best-effort image copy
-        except Exception:
-            pass  # relationships may not be accessible in all docx variants
+                    except (KeyError, AttributeError) as e:
+                        log.warning("could not copy cover image relationship: %s", e)
+        except AttributeError as e:
+            log.debug("cover doc has no accessible relationships: %s", e)
 
         # ── Close the cover section (same logic as add_frontpage) ────────────
         sep_para   = self.doc.add_paragraph()
@@ -2255,9 +2259,11 @@ class DocumentBuilder:
                 run = img_para.add_run()
                 try:
                     run.add_picture(str(fp), width=Inches(self._img.inches(w_emu)))
-                except Exception:
+                except (FileNotFoundError, OSError) as e:
+                    log.warning("could not embed image %s: %s", path_str, e)
                     img_para.add_run(f"[{path_str}]")
             else:
+                log.warning("image not found: %s", path_str)
                 img_para.add_run(f"[Image not found: {path_str}]")
 
             # Sub-caption:  a) Description text
@@ -2370,7 +2376,8 @@ class DocumentBuilder:
         run = para.add_run()
         try:
             run.add_picture(str(full_path), width=Inches(self._img.inches(w_emu)))
-        except Exception:
+        except (FileNotFoundError, OSError) as e:
+            log.warning("could not embed image %s: %s", path_str, e)
             para.add_run(f"[Could not load: {path_str}]")
 
     # ── inline content ────────────────────────────────────────────────────────
@@ -2489,9 +2496,11 @@ class DocumentBuilder:
                     try:
                         run = para.add_run()
                         run.add_picture(str(fp), width=Inches(self._img.inches(w_emu)))
-                    except Exception:
+                    except (FileNotFoundError, OSError) as e:
+                        log.warning("could not embed image %s: %s", path_str, e)
                         para.add_run(f"[{path_str}]")
                 else:
+                    log.warning("image not found: %s", path_str)
                     para.add_run(f"[Image: {path_str}]")
 
             elif ct in ("LineBreak", "HardBreak"):

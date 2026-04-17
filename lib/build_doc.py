@@ -23,6 +23,9 @@ from typing import Optional
 import yaml
 
 from lib.build.builder import DocumentBuilder
+from lib.log import configure as _configure_logging, get_logger
+
+log = get_logger(__name__)
 
 
 # ── path helpers ──────────────────────────────────────────────────────────────
@@ -48,9 +51,7 @@ def load_config(path: Path) -> dict:
             with open(path, encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
         except Exception as e:
-            import sys
-            print(f"  Warning: could not parse config.yaml ({e}) — using defaults.",
-                  file=sys.stderr)
+            log.warning("could not parse config.yaml (%s) — using defaults.", e)
             return {}
     return {}
 
@@ -173,7 +174,13 @@ Project location: {project_root}
                     help="config.yaml path (default: input/config.yaml)")
     ap.add_argument("--template", default=None,
                     help="Word .docx template to use as base document")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="Enable debug-level logging")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="Suppress warnings (errors only)")
     args = ap.parse_args()
+
+    _configure_logging(verbose=args.verbose, quiet=args.quiet)
 
     # Resolve paths
     source      = resolve_user_path(args.source) if args.source else get_default_path("input")
@@ -258,7 +265,7 @@ Project location: {project_root}
         try:
             builder.add_content(cf_text, cf.parent)
         except Exception as e:
-            print(f"Warning: error processing {cf.name}: {e}", file=sys.stderr)
+            log.warning("error processing %s: %s", cf.name, e)
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
