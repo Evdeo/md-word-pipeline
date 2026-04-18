@@ -1,0 +1,3 @@
+# Per-project settings. The `config` key names a file under ../../configs/.
+# Any of `output` or `title_override` are optional overrides.
+config: default

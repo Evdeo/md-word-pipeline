@@ -7,7 +7,7 @@ One-line usage in every module:
     log.info("...")
     log.warning("image not found: %s", path)
 
-At process start (e.g. in run.py or build_doc.py) call configure(verbose=..., quiet=...).
+At process start (e.g. in md.py) call configure(verbose=..., quiet=...).
 If nothing calls configure(), the handler defaults to WARNING-level on stderr
 so test runs stay quiet.
 """

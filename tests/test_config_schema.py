@@ -8,7 +8,7 @@ def test_valid_default_config_passes_silently(caplog):
     """The bundled default.yaml must validate without warnings."""
     import yaml
     from pathlib import Path
-    default_path = Path(__file__).resolve().parent.parent / "lib" / "configs" / "default.yaml"
+    default_path = Path(__file__).resolve().parent.parent / "configs" / "default.yaml"
     raw = yaml.safe_load(default_path.read_text(encoding="utf-8"))
     caplog.set_level(logging.WARNING, logger="md_word_pipeline.config_schema")
     validate_config(raw)

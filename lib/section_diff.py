@@ -1001,3 +1001,46 @@ document.addEventListener('keydown', e => {{
 </script>
 </body>
 </html>"""
+
+
+def run(ctx, open_browser: bool = True) -> Optional[Path]:
+    """Build a fresh baseline from the project source, diff it against the
+    newest docx in ``projects/<name>/output/received/``, and write an HTML
+    report to ``output/review_report.html``.
+
+    Returns the report path, or ``None`` if no received file exists.
+    """
+    import shutil
+    import tempfile
+    import webbrowser
+
+    from lib.config_loader import build as _build
+    from lib.sync import _find_received_docx
+
+    received = _find_received_docx(ctx.output_dir)
+    if received is None:
+        print(f"No docx found in {ctx.output_dir / 'received'}/ — "
+              "drop a reviewer copy there and retry.")
+        return None
+
+    tmp_dir  = Path(tempfile.mkdtemp())
+    baseline = tmp_dir / "baseline.docx"
+    try:
+        _build(ctx, out_path=baseline)
+        results = diff_documents(baseline, received)
+        html = build_html_report(
+            results, baseline, received,
+            baseline_label="Your current source",
+            received_label=received.name,
+        )
+        report = ctx.output_dir / "review_report.html"
+        report.write_text(html, encoding="utf-8")
+        print(f"Wrote review report: {report}")
+        if open_browser:
+            try:
+                webbrowser.open(report.as_uri())
+            except Exception:
+                pass
+        return report
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)

@@ -1,9 +1,6 @@
 # Preview render files (generated each session)
 projects/*/output/render/
 
-# Template build artifacts
-lib/templates/*/output/
-
 # Python cache
 __pycache__/
 *.pyc

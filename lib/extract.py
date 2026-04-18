@@ -1120,6 +1120,54 @@ def write_imported(
         file_index += 1
 
 
+def extract_to_project(docx_path: Path, project_dir: Path,
+                       config: Optional[dict] = None) -> None:
+    """Extract a .docx into the given project folder (flat layout).
+
+    Writes ``00-frontpage.md``, ``document-info.yaml`` (merged with any
+    existing one), and one content file per H1. Images land in
+    ``project_dir/images/``. Size-class mapping uses the given config
+    dict (if provided) or defaults.
+    """
+    from lib.build.images import build_size_classes, DEFAULT_SIZE_CLASSES
+
+    docx_path   = Path(docx_path).resolve()
+    project_dir = Path(project_dir).resolve()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = project_dir / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    if config:
+        size_classes = build_size_classes(config.get("image_sizes"))
+        page_cfg = config.get("page", {})
+        size_str = str(page_cfg.get("size", "A4")).upper()
+        page_w = (int(21.0 / 2.54 * EMU_PER_INCH) if "A4" in size_str
+                  else int(21.59 / 2.54 * EMU_PER_INCH))
+
+        def _cm(v, default_cm=2.54):
+            try:
+                val = float(str(v).replace("cm", "").replace("in", "").strip())
+                return (int(val * EMU_PER_INCH) if "in" in str(v)
+                        else int(val / 2.54 * EMU_PER_INCH))
+            except Exception:
+                return int(default_cm / 2.54 * EMU_PER_INCH)
+
+        content_width_emu = page_w \
+            - _cm(page_cfg.get("margin_left",  "2.54cm")) \
+            - _cm(page_cfg.get("margin_right", "2.54cm"))
+    else:
+        size_classes = dict(DEFAULT_SIZE_CLASSES)
+        content_width_emu = int(15.92 / 2.54 * EMU_PER_INCH)  # A4 – 2×2.54cm
+
+    doc = Document(str(docx_path))
+    sections, revisions_found = extract_body_sections(
+        doc, images_dir, size_classes, content_width_emu)
+
+    di_path = project_dir / "document-info.yaml"
+    document_info = merge_document_info(di_path, revisions_found)
+    write_imported(project_dir, sections, document_info)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():

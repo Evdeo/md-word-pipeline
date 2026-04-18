@@ -10,7 +10,7 @@ So I write in Markdown, keep everything about the document's appearance in a con
 
 ## What it does
 
-**Consistent output.** Fonts, heading sizes, colours, table styles, margins, headers, footers — all in `config.yaml`. Same config, same document, every time.
+**Consistent output.** Fonts, heading sizes, colours, table styles, margins, headers, footers — all in `configs/<name>.yaml`, shared across projects. Same config, same document, every time.
 
 **Auto-numbered figures and tables.** Tag a caption with `{#fig-arch}` and reference it as `[Figure 1](#fig-arch)`. Reorder the figures — the numbers update.
 
@@ -23,20 +23,52 @@ So I write in Markdown, keep everything about the document's appearance in a con
 ## Getting started
 
 ```bash
-python run.py
+pip install -r lib/requirements.txt
+python md.py showcase
 ```
 
-Dependencies install on first run. Requires Python 3.10+ and Word to open the output.
+The first command opens a browser with the live preview of the bundled
+showcase project. Edit any `.md` / `.yaml` file in `projects/showcase/`
+and the preview rebuilds within a few seconds. Ctrl+C stops it.
+
+Requires Python 3.10+ and Microsoft Word (for the preview's
+docx → PDF step).
+
+### Everything else (rare)
+
+```
+python md.py                          pick project, then action, from a menu
+python md.py <project>                live preview (the 95% case)
+python md.py <project> -build         build once → projects/<project>/output/
+python md.py <project> -diff          section-diff vs output/received/
+python md.py <project> -open          open the built docx in Word
+python md.py <project> -import FILE   extract a docx into this project
+python md.py -new <name>              scaffold a new empty project
+```
+
+`-b`, `-d`, `-o`, `-i` are short aliases.
 
 ---
 
 ## Creating a project
 
-Three options:
+```bash
+python md.py -new my-doc
+```
 
-1. **Minimal template** — bare bones
-2. **Full template** — complete example with every feature
-3. **Import from Word** — converts an existing `.docx` to Markdown *(rough around the edges, some manual cleanup needed)*
+Makes `projects/my-doc/` from `projects/_template/`. It refuses if the
+name is taken — never overwrites. Edit the YAML files in VS Code, then
+`python md.py my-doc` to start the preview.
+
+To bootstrap from an existing Word file:
+
+```bash
+python md.py -new my-doc
+python md.py my-doc -import path/to/existing.docx
+```
+
+`-import` refuses to run if `content.md` is already populated, so you
+can't clobber a live project by accident.
 
 ---
 
@@ -44,28 +76,28 @@ Three options:
 
 ```
 my-project/
-├── input/
-│   ├── content.md          ← write here
-│   ├── config.yaml         ← controls how the document looks
-│   ├── document-info.yaml  ← title, author, version, revision history
-│   └── properties.yaml     ← custom variables
+├── project.yaml            ← names which config/ preset to use
+├── content.md              ← write here (or several *.md files)
+├── 00-frontpage.md         ← optional cover page
+├── document-info.yaml      ← title, author, version, revision history
+├── properties.yaml         ← custom variables
+├── revisions.yaml          ← revision-history table
+├── images/
 └── output/
     ├── document.docx
     ├── received/           ← drop reviewed files here
     └── review_report.html
 ```
 
----
+The shared layout config lives at the repo root under `configs/` — e.g.
+`configs/default.yaml`. A project says which config to use via its
+`project.yaml`:
 
-## Inside a project
-
-- **Build** — generates the Word file
-- **Export** — copies it somewhere
-- **Open document** — opens it in Word
-- **Open in VS Code** — opens the project folder
-- **Review changes** — compares a received file against your source
-- **Edit document info** — title, author, version, classification
-- **Edit properties** — custom variables
+```yaml
+config: default                 # required: references configs/<name>.yaml
+output: my-doc.docx             # optional: override the output filename
+title_override: "Draft 3"       # optional: override document-info.yaml title
+```
 
 ---
 
@@ -74,7 +106,7 @@ my-project/
 1. Build and send the document
 2. Someone edits it and sends it back
 3. Drop the file in `output/received/`
-4. Select **Review changes**
+4. Run `python md.py <project> -diff`
 
 Builds a fresh copy from your current source, diffs it section by section against the received file, opens an HTML report.
 
@@ -230,7 +262,11 @@ Headings become A, A.1, A.2, B, B.1 etc.
 
 ## Defaults
 
-The main menu has a **Change defaults** option for the config applied to every new project. Edit the YAML directly, copy settings from a project, or go field by field and pick what to keep.
+Edit `configs/default.yaml` in VS Code. Every project that says
+`config: default` in its `project.yaml` rebuilds against the updated
+values next time you run the preview or `-build`. For alternate
+presets, drop a `configs/<name>.yaml` next to it and reference it
+from `project.yaml`.
 
 ---
 
